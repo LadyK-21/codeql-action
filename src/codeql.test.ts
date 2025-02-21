@@ -1,7 +1,8 @@
 import * as fs from "fs";
-import * as path from "path";
 
+import { ExecOptions } from "@actions/exec";
 import * as toolrunner from "@actions/exec/lib/toolrunner";
+import * as io from "@actions/io";
 import * as toolcache from "@actions/tool-cache";
 import test, { ExecutionContext } from "ava";
 import del from "del";
@@ -9,113 +10,107 @@ import * as yaml from "js-yaml";
 import nock from "nock";
 import * as sinon from "sinon";
 
+import * as actionsUtil from "./actions-util";
 import { GitHubApiDetails } from "./api-client";
+import { CliError } from "./cli-errors";
 import * as codeql from "./codeql";
 import { AugmentationProperties, Config } from "./config-utils";
 import * as defaults from "./defaults.json";
-import { createFeatureFlags, FeatureFlag, FeatureFlags } from "./feature-flags";
+import { DocUrl } from "./doc-url";
+import { FeatureEnablement } from "./feature-flags";
 import { Language } from "./languages";
 import { getRunnerLogger } from "./logging";
-import { setupTests, setupActionsVars } from "./testing-utils";
+import { ToolsSource } from "./setup-codeql";
+import {
+  setupTests,
+  createFeatures,
+  setupActionsVars,
+  SAMPLE_DOTCOM_API_DETAILS,
+  SAMPLE_DEFAULT_CLI_VERSION,
+  mockBundleDownloadApi,
+  makeVersionInfo,
+  createTestConfig,
+} from "./testing-utils";
+import { ToolsDownloadStatusReport } from "./tools-download";
+import { ToolsFeature } from "./tools-features";
 import * as util from "./util";
-import { Mode, initializeEnvironment } from "./util";
+import { initializeEnvironment } from "./util";
 
 setupTests(test);
 
-const sampleApiDetails = {
-  auth: "token",
-  url: "https://github.com",
-  apiURL: undefined,
-  registriesAuthTokens: undefined,
-};
-
-const sampleGHAEApiDetails = {
-  auth: "token",
-  url: "https://example.githubenterprise.com",
-  apiURL: undefined,
-  registriesAuthTokens: undefined,
-};
-
 let stubConfig: Config;
 
-test.beforeEach(() => {
-  initializeEnvironment(Mode.actions, "1.2.3");
+const NO_FEATURES: FeatureEnablement = createFeatures([]);
 
-  stubConfig = {
+test.beforeEach(() => {
+  initializeEnvironment("1.2.3");
+
+  stubConfig = createTestConfig({
     languages: [Language.cpp],
-    queries: {},
-    pathsIgnore: [],
-    paths: [],
-    originalUserInput: {},
-    tempDir: "",
-    codeQLCmd: "",
-    gitHubVersion: {
-      type: util.GitHubVariant.DOTCOM,
-    } as util.GitHubVersion,
-    dbLocation: "",
-    packs: {},
-    debugMode: false,
-    debugArtifactName: util.DEFAULT_DEBUG_ARTIFACT_NAME,
-    debugDatabaseName: util.DEFAULT_DEBUG_DATABASE_NAME,
-    augmentationProperties: {
-      injectedMlQueries: false,
-      packsInputCombines: false,
-      queriesInputCombines: false,
-    },
-    trapCaches: {},
-    trapCacheDownloadTime: 0,
-  };
+  });
 });
 
-async function mockApiAndSetupCodeQL({
-  apiDetails,
-  featureFlags,
+async function installIntoToolcache({
+  apiDetails = SAMPLE_DOTCOM_API_DETAILS,
+  cliVersion,
   isPinned,
+  tagName,
   tmpDir,
-  toolsInput,
-  version,
 }: {
   apiDetails?: GitHubApiDetails;
-  featureFlags?: FeatureFlags;
-  isPinned?: boolean;
+  cliVersion?: string;
+  isPinned: boolean;
+  tagName: string;
   tmpDir: string;
-  toolsInput?: { input?: string };
-  version: string;
 }) {
-  const platform =
-    process.platform === "win32"
-      ? "win64"
-      : process.platform === "linux"
-      ? "linux64"
-      : "osx64";
-
-  const baseUrl = apiDetails?.url ?? "https://example.com";
-  const relativeUrl = apiDetails
-    ? `/github/codeql-action/releases/download/${version}/codeql-bundle-${platform}.tar.gz`
-    : `/download/codeql-bundle-${version}/codeql-bundle.tar.gz`;
-
-  nock(baseUrl)
-    .get(relativeUrl)
-    .replyWithFile(
-      200,
-      path.join(
-        __dirname,
-        `/../src/testdata/codeql-bundle${isPinned ? "-pinned" : ""}.tar.gz`
-      )
-    );
-
+  const url = mockBundleDownloadApi({ apiDetails, isPinned, tagName });
   await codeql.setupCodeQL(
-    toolsInput ? toolsInput.input : `${baseUrl}${relativeUrl}`,
-    apiDetails ?? sampleApiDetails,
+    cliVersion !== undefined ? undefined : url,
+    apiDetails,
     tmpDir,
-    util.GitHubVariant.DOTCOM,
-    featureFlags ?? createFeatureFlags([]),
+    util.GitHubVariant.GHES,
+    cliVersion !== undefined
+      ? { cliVersion, tagName }
+      : SAMPLE_DEFAULT_CLI_VERSION,
     getRunnerLogger(true),
-    false
+    NO_FEATURES,
+    false,
   );
 }
 
-test("download codeql bundle cache", async (t) => {
+function mockReleaseApi({
+  apiDetails = SAMPLE_DOTCOM_API_DETAILS,
+  assetNames,
+  tagName,
+}: {
+  apiDetails?: GitHubApiDetails;
+  assetNames: string[];
+  tagName: string;
+}): nock.Scope {
+  return nock(apiDetails.apiURL!)
+    .get(`/repos/github/codeql-action/releases/tags/${tagName}`)
+    .reply(200, {
+      assets: assetNames.map((name) => ({
+        name,
+      })),
+      tag_name: tagName,
+    });
+}
+
+function mockApiDetails(apiDetails: GitHubApiDetails) {
+  // This is a workaround to mock `api.getApiDetails()` since it doesn't seem to be possible to
+  // mock this directly. The difficulty is that `getApiDetails()` is called locally in
+  // `api-client.ts`, but `sinon.stub(api, "getApiDetails")` only affects calls to
+  // `getApiDetails()` via an imported `api` module.
+  sinon
+    .stub(actionsUtil, "getRequiredInput")
+    .withArgs("token")
+    .returns(apiDetails.auth);
+  process.env["GITHUB_SERVER_URL"] = apiDetails.url;
+  process.env["GITHUB_API_URL"] = apiDetails.apiURL || "";
+}
+
+test("downloads and caches explicitly requested bundles that aren't in the toolcache", async (t) => {
   await util.withTmpDir(async (tmpDir) => {
     setupActionsVars(tmpDir, tmpDir);
 
@@ -124,240 +119,330 @@ test("download codeql bundle cache", async (t) => {
     for (let i = 0; i < versions.length; i++) {
       const version = versions[i];
 
-      await mockApiAndSetupCodeQL({ version, tmpDir });
+      const url = mockBundleDownloadApi({
+        tagName: `codeql-bundle-${version}`,
+        isPinned: false,
+      });
+      const result = await codeql.setupCodeQL(
+        url,
+        SAMPLE_DOTCOM_API_DETAILS,
+        tmpDir,
+        util.GitHubVariant.DOTCOM,
+        SAMPLE_DEFAULT_CLI_VERSION,
+        getRunnerLogger(true),
+        NO_FEATURES,
+        false,
+      );
+
       t.assert(toolcache.find("CodeQL", `0.0.0-${version}`));
+      t.is(result.toolsVersion, `0.0.0-${version}`);
+      t.is(result.toolsSource, ToolsSource.Download);
     }
 
     t.is(toolcache.findAllVersions("CodeQL").length, 2);
   });
 });
 
-test("download codeql bundle cache explicitly requested with pinned different version cached", async (t) => {
+test("caches semantically versioned bundles using their semantic version number", async (t) => {
   await util.withTmpDir(async (tmpDir) => {
     setupActionsVars(tmpDir, tmpDir);
-
-    await mockApiAndSetupCodeQL({
-      version: "20200601",
-      isPinned: true,
-      tmpDir,
+    const url = mockBundleDownloadApi({
+      tagName: `codeql-bundle-v2.15.0`,
+      isPinned: false,
     });
-    t.assert(toolcache.find("CodeQL", "0.0.0-20200601"));
-
-    await mockApiAndSetupCodeQL({ version: "20200610", tmpDir });
-    t.assert(toolcache.find("CodeQL", "0.0.0-20200610"));
-  });
-});
-
-test("don't download codeql bundle cache with pinned different version cached", async (t) => {
-  await util.withTmpDir(async (tmpDir) => {
-    setupActionsVars(tmpDir, tmpDir);
-
-    await mockApiAndSetupCodeQL({
-      version: "20200601",
-      isPinned: true,
-      tmpDir,
-    });
-
-    t.assert(toolcache.find("CodeQL", "0.0.0-20200601"));
-
-    await codeql.setupCodeQL(
-      undefined,
-      sampleApiDetails,
+    const result = await codeql.setupCodeQL(
+      url,
+      SAMPLE_DOTCOM_API_DETAILS,
       tmpDir,
       util.GitHubVariant.DOTCOM,
-      createFeatureFlags([]),
+      SAMPLE_DEFAULT_CLI_VERSION,
       getRunnerLogger(true),
-      false
+      NO_FEATURES,
+      false,
     );
 
-    const cachedVersions = toolcache.findAllVersions("CodeQL");
-
-    t.is(cachedVersions.length, 1);
+    t.is(toolcache.findAllVersions("CodeQL").length, 1);
+    t.assert(toolcache.find("CodeQL", `2.15.0`));
+    t.is(result.toolsVersion, `2.15.0`);
+    t.is(result.toolsSource, ToolsSource.Download);
+    if (result.toolsDownloadStatusReport) {
+      assertDurationsInteger(t, result.toolsDownloadStatusReport);
+    }
   });
 });
 
-test("download codeql bundle cache with different version cached (not pinned)", async (t) => {
+test("downloads an explicitly requested bundle even if a different version is cached", async (t) => {
   await util.withTmpDir(async (tmpDir) => {
     setupActionsVars(tmpDir, tmpDir);
 
-    await mockApiAndSetupCodeQL({ version: "20200601", tmpDir });
-
-    t.assert(toolcache.find("CodeQL", "0.0.0-20200601"));
-
-    await mockApiAndSetupCodeQL({
-      version: defaults.bundleVersion,
-      tmpDir,
-      apiDetails: sampleApiDetails,
-      toolsInput: { input: undefined },
-    });
-
-    const cachedVersions = toolcache.findAllVersions("CodeQL");
-
-    t.is(cachedVersions.length, 2);
-  });
-});
-
-test('download codeql bundle cache with pinned different version cached if "latest" tools specified', async (t) => {
-  await util.withTmpDir(async (tmpDir) => {
-    setupActionsVars(tmpDir, tmpDir);
-
-    await mockApiAndSetupCodeQL({
-      version: "20200601",
+    await installIntoToolcache({
+      tagName: "codeql-bundle-20200601",
       isPinned: true,
       tmpDir,
     });
 
-    t.assert(toolcache.find("CodeQL", "0.0.0-20200601"));
-
-    await mockApiAndSetupCodeQL({
-      version: defaults.bundleVersion,
-      apiDetails: sampleApiDetails,
-      toolsInput: { input: "latest" },
-      tmpDir,
+    const url = mockBundleDownloadApi({
+      tagName: "codeql-bundle-20200610",
     });
-
-    const cachedVersions = toolcache.findAllVersions("CodeQL");
-
-    t.is(cachedVersions.length, 2);
+    const result = await codeql.setupCodeQL(
+      url,
+      SAMPLE_DOTCOM_API_DETAILS,
+      tmpDir,
+      util.GitHubVariant.DOTCOM,
+      SAMPLE_DEFAULT_CLI_VERSION,
+      getRunnerLogger(true),
+      NO_FEATURES,
+      false,
+    );
+    t.assert(toolcache.find("CodeQL", "0.0.0-20200610"));
+    t.deepEqual(result.toolsVersion, "0.0.0-20200610");
+    t.is(result.toolsSource, ToolsSource.Download);
+    if (result.toolsDownloadStatusReport) {
+      assertDurationsInteger(t, result.toolsDownloadStatusReport);
+    }
   });
 });
 
-const TOOLCACHE_BYPASS_TEST_CASES: Array<
-  [boolean, string | undefined, boolean]
-> = [
-  [true, undefined, true],
-  [false, undefined, false],
-  [
-    true,
-    "https://github.com/github/codeql-action/releases/download/codeql-bundle-20200601/codeql-bundle.tar.gz",
-    false,
-  ],
+const EXPLICITLY_REQUESTED_BUNDLE_TEST_CASES = [
+  {
+    tagName: "codeql-bundle-2.17.6",
+    expectedToolcacheVersion: "2.17.6",
+  },
+  {
+    tagName: "codeql-bundle-20240805",
+    expectedToolcacheVersion: "0.0.0-20240805",
+  },
 ];
 
-for (const [
-  isFeatureFlagEnabled,
-  toolsInput,
-  shouldToolcacheBeBypassed,
-] of TOOLCACHE_BYPASS_TEST_CASES) {
-  test(`download codeql bundle ${
-    shouldToolcacheBeBypassed ? "bypasses" : "does not bypass"
-  } toolcache when feature flag ${
-    isFeatureFlagEnabled ? "enabled" : "disabled"
-  } and tools: ${toolsInput} passed`, async (t) => {
+for (const {
+  tagName,
+  expectedToolcacheVersion,
+} of EXPLICITLY_REQUESTED_BUNDLE_TEST_CASES) {
+  test(`caches explicitly requested bundle ${tagName} as ${expectedToolcacheVersion}`, async (t) => {
     await util.withTmpDir(async (tmpDir) => {
       setupActionsVars(tmpDir, tmpDir);
 
-      await mockApiAndSetupCodeQL({
-        version: "codeql-bundle-20200601",
-        apiDetails: sampleApiDetails,
-        isPinned: true,
-        tmpDir,
+      mockApiDetails(SAMPLE_DOTCOM_API_DETAILS);
+      sinon.stub(actionsUtil, "isRunningLocalAction").returns(true);
+
+      const url = mockBundleDownloadApi({
+        tagName,
       });
 
-      t.assert(toolcache.find("CodeQL", "0.0.0-20200601"));
-
-      await mockApiAndSetupCodeQL({
-        version: defaults.bundleVersion,
-        apiDetails: sampleApiDetails,
-        featureFlags: createFeatureFlags(
-          isFeatureFlagEnabled ? [FeatureFlag.BypassToolcacheEnabled] : []
-        ),
-        toolsInput: { input: toolsInput },
+      const result = await codeql.setupCodeQL(
+        url,
+        SAMPLE_DOTCOM_API_DETAILS,
         tmpDir,
-      });
-
-      const cachedVersions = toolcache.findAllVersions("CodeQL");
-
-      t.is(cachedVersions.length, shouldToolcacheBeBypassed ? 2 : 1);
+        util.GitHubVariant.DOTCOM,
+        SAMPLE_DEFAULT_CLI_VERSION,
+        getRunnerLogger(true),
+        NO_FEATURES,
+        false,
+      );
+      t.assert(toolcache.find("CodeQL", expectedToolcacheVersion));
+      t.deepEqual(result.toolsVersion, expectedToolcacheVersion);
+      t.is(result.toolsSource, ToolsSource.Download);
+      t.assert(
+        Number.isInteger(result.toolsDownloadStatusReport?.downloadDurationMs),
+      );
     });
   });
 }
 
-test("download codeql bundle from github ae endpoint", async (t) => {
+for (const toolcacheVersion of [
+  // Test that we use the tools from the toolcache when `SAMPLE_DEFAULT_CLI_VERSION` is requested
+  // and `SAMPLE_DEFAULT_CLI_VERSION-` is in the toolcache.
+  SAMPLE_DEFAULT_CLI_VERSION.cliVersion,
+  `${SAMPLE_DEFAULT_CLI_VERSION.cliVersion}-20230101`,
+]) {
+  test(
+    `uses tools from toolcache when ${SAMPLE_DEFAULT_CLI_VERSION.cliVersion} is requested and ` +
+      `${toolcacheVersion} is installed`,
+    async (t) => {
+      await util.withTmpDir(async (tmpDir) => {
+        setupActionsVars(tmpDir, tmpDir);
+
+        sinon
+          .stub(toolcache, "find")
+          .withArgs("CodeQL", toolcacheVersion)
+          .returns("path/to/cached/codeql");
+        sinon.stub(toolcache, "findAllVersions").returns([toolcacheVersion]);
+
+        const result = await codeql.setupCodeQL(
+          undefined,
+          SAMPLE_DOTCOM_API_DETAILS,
+          tmpDir,
+          util.GitHubVariant.DOTCOM,
+          SAMPLE_DEFAULT_CLI_VERSION,
+          getRunnerLogger(true),
+          NO_FEATURES,
+          false,
+        );
+        t.is(result.toolsVersion, SAMPLE_DEFAULT_CLI_VERSION.cliVersion);
+        t.is(result.toolsSource, ToolsSource.Toolcache);
+        t.is(result.toolsDownloadStatusReport?.combinedDurationMs, undefined);
+        t.is(result.toolsDownloadStatusReport?.downloadDurationMs, undefined);
+        t.is(result.toolsDownloadStatusReport?.extractionDurationMs, undefined);
+      });
+    },
+  );
+}
+
+test(`uses a cached bundle when no tools input is given on GHES`, async (t) => {
   await util.withTmpDir(async (tmpDir) => {
     setupActionsVars(tmpDir, tmpDir);
 
-    const bundleAssetID = 10;
-
-    const platform =
-      process.platform === "win32"
-        ? "win64"
-        : process.platform === "linux"
-        ? "linux64"
-        : "osx64";
-    const codeQLBundleName = `codeql-bundle-${platform}.tar.gz`;
-
-    nock("https://example.githubenterprise.com")
-      .get(
-        `/api/v3/enterprise/code-scanning/codeql-bundle/find/${defaults.bundleVersion}`
-      )
-      .reply(200, {
-        assets: { [codeQLBundleName]: bundleAssetID },
-      });
-
-    nock("https://example.githubenterprise.com")
-      .get(
-        `/api/v3/enterprise/code-scanning/codeql-bundle/download/${bundleAssetID}`
-      )
-      .reply(200, {
-        url: `https://example.githubenterprise.com/github/codeql-action/releases/download/${defaults.bundleVersion}/${codeQLBundleName}`,
-      });
-
-    nock("https://example.githubenterprise.com")
-      .get(
-        `/github/codeql-action/releases/download/${defaults.bundleVersion}/${codeQLBundleName}`
-      )
-      .replyWithFile(
-        200,
-        path.join(__dirname, `/../src/testdata/codeql-bundle-pinned.tar.gz`)
-      );
-
-    await codeql.setupCodeQL(
-      undefined,
-      sampleGHAEApiDetails,
+    await installIntoToolcache({
+      tagName: "codeql-bundle-20200601",
+      isPinned: true,
       tmpDir,
-      util.GitHubVariant.GHAE,
-      createFeatureFlags([]),
+    });
+
+    const result = await codeql.setupCodeQL(
+      undefined,
+      SAMPLE_DOTCOM_API_DETAILS,
+      tmpDir,
+      util.GitHubVariant.GHES,
+      {
+        cliVersion: defaults.cliVersion,
+        tagName: defaults.bundleVersion,
+      },
       getRunnerLogger(true),
-      false
+      NO_FEATURES,
+      false,
     );
+    t.deepEqual(result.toolsVersion, "0.0.0-20200601");
+    t.is(result.toolsSource, ToolsSource.Toolcache);
+    t.is(result.toolsDownloadStatusReport?.combinedDurationMs, undefined);
+    t.is(result.toolsDownloadStatusReport?.downloadDurationMs, undefined);
+    t.is(result.toolsDownloadStatusReport?.extractionDurationMs, undefined);
 
     const cachedVersions = toolcache.findAllVersions("CodeQL");
     t.is(cachedVersions.length, 1);
   });
 });
 
-test("parse codeql bundle url version", (t) => {
-  t.deepEqual(
-    codeql.getCodeQLURLVersion(
-      "https://github.com/.../codeql-bundle-20200601/..."
-    ),
-    "20200601"
-  );
-});
+test(`downloads bundle if only an unpinned version is cached on GHES`, async (t) => {
+  await util.withTmpDir(async (tmpDir) => {
+    setupActionsVars(tmpDir, tmpDir);
 
-test("convert to semver", (t) => {
-  const tests = {
-    "20200601": "0.0.0-20200601",
-    "20200601.0": "0.0.0-20200601.0",
-    "20200601.0.0": "20200601.0.0",
-    "1.2.3": "1.2.3",
-    "1.2.3-alpha": "1.2.3-alpha",
-    "1.2.3-beta.1": "1.2.3-beta.1",
-  };
+    await installIntoToolcache({
+      tagName: "codeql-bundle-20200601",
+      isPinned: false,
+      tmpDir,
+    });
 
-  for (const [version, expectedVersion] of Object.entries(tests)) {
-    try {
-      const parsedVersion = codeql.convertToSemVer(
-        version,
-        getRunnerLogger(true)
-      );
-      t.deepEqual(parsedVersion, expectedVersion);
-    } catch (e) {
-      t.fail(e instanceof Error ? e.message : String(e));
+    mockBundleDownloadApi({
+      tagName: defaults.bundleVersion,
+    });
+    const result = await codeql.setupCodeQL(
+      undefined,
+      SAMPLE_DOTCOM_API_DETAILS,
+      tmpDir,
+      util.GitHubVariant.GHES,
+      {
+        cliVersion: defaults.cliVersion,
+        tagName: defaults.bundleVersion,
+      },
+      getRunnerLogger(true),
+      NO_FEATURES,
+      false,
+    );
+    t.deepEqual(result.toolsVersion, defaults.cliVersion);
+    t.is(result.toolsSource, ToolsSource.Download);
+    if (result.toolsDownloadStatusReport) {
+      assertDurationsInteger(t, result.toolsDownloadStatusReport);
     }
-  }
+
+    const cachedVersions = toolcache.findAllVersions("CodeQL");
+    t.is(cachedVersions.length, 2);
+  });
 });
+
+test('downloads bundle if "latest" tools specified but not cached', async (t) => {
+  await util.withTmpDir(async (tmpDir) => {
+    setupActionsVars(tmpDir, tmpDir);
+
+    await installIntoToolcache({
+      tagName: "codeql-bundle-20200601",
+      isPinned: true,
+      tmpDir,
+    });
+
+    mockBundleDownloadApi({
+      tagName: defaults.bundleVersion,
+    });
+    const result = await codeql.setupCodeQL(
+      "latest",
+      SAMPLE_DOTCOM_API_DETAILS,
+      tmpDir,
+      util.GitHubVariant.DOTCOM,
+      SAMPLE_DEFAULT_CLI_VERSION,
+      getRunnerLogger(true),
+      NO_FEATURES,
+      false,
+    );
+    t.deepEqual(result.toolsVersion, defaults.cliVersion);
+    t.is(result.toolsSource, ToolsSource.Download);
+    if (result.toolsDownloadStatusReport) {
+      assertDurationsInteger(t, result.toolsDownloadStatusReport);
+    }
+
+    const cachedVersions = toolcache.findAllVersions("CodeQL");
+    t.is(cachedVersions.length, 2);
+  });
+});
+
+test("bundle URL from another repo is cached as 0.0.0-bundleVersion", async (t) => {
+  await util.withTmpDir(async (tmpDir) => {
+    setupActionsVars(tmpDir, tmpDir);
+
+    mockApiDetails(SAMPLE_DOTCOM_API_DETAILS);
+    sinon.stub(actionsUtil, "isRunningLocalAction").returns(true);
+    const releasesApiMock = mockReleaseApi({
+      assetNames: ["cli-version-2.14.6.txt"],
+      tagName: "codeql-bundle-20230203",
+    });
+    mockBundleDownloadApi({
+      repo: "codeql-testing/codeql-cli-nightlies",
+      platformSpecific: false,
+      tagName: "codeql-bundle-20230203",
+    });
+    const result = await codeql.setupCodeQL(
+      "https://github.com/codeql-testing/codeql-cli-nightlies/releases/download/codeql-bundle-20230203/codeql-bundle.tar.gz",
+      SAMPLE_DOTCOM_API_DETAILS,
+      tmpDir,
+      util.GitHubVariant.DOTCOM,
+      SAMPLE_DEFAULT_CLI_VERSION,
+      getRunnerLogger(true),
+      NO_FEATURES,
+      false,
+    );
+
+    t.is(result.toolsVersion, "0.0.0-20230203");
+    t.is(result.toolsSource, ToolsSource.Download);
+    if (result.toolsDownloadStatusReport) {
+      assertDurationsInteger(t, result.toolsDownloadStatusReport);
+    }
+
+    const cachedVersions = toolcache.findAllVersions("CodeQL");
+    t.is(cachedVersions.length, 1);
+    t.is(cachedVersions[0], "0.0.0-20230203");
+
+    t.false(releasesApiMock.isDone());
+  });
+});
+
+function assertDurationsInteger(
+  t: ExecutionContext<unknown>,
+  statusReport: ToolsDownloadStatusReport,
+) {
+  t.assert(Number.isInteger(statusReport?.combinedDurationMs));
+  if (statusReport.downloadDurationMs !== undefined) {
+    t.assert(Number.isInteger(statusReport?.downloadDurationMs));
+    t.assert(Number.isInteger(statusReport?.extractionDurationMs));
+  }
+}
 
 test("getExtraOptions works for explicit paths", (t) => {
   t.deepEqual(codeql.getExtraOptions({}, ["foo"], []), []);
@@ -366,7 +451,7 @@ test("getExtraOptions works for explicit paths", (t) => {
 
   t.deepEqual(
     codeql.getExtraOptions({ foo: { bar: [42] } }, ["foo", "bar"], []),
-    ["42"]
+    ["42"],
   );
 });
 
@@ -395,85 +480,9 @@ test("getExtraOptions throws for bad content", (t) => {
     codeql.getExtraOptions(
       { "*": [42], foo: { "*": 87, bar: [99] } },
       ["foo", "bar"],
-      []
-    )
+      [],
+    ),
   );
-});
-
-test("getCodeQLActionRepository", (t) => {
-  const logger = getRunnerLogger(true);
-
-  initializeEnvironment(Mode.runner, "1.2.3");
-  const repoActions = codeql.getCodeQLActionRepository(logger);
-  t.deepEqual(repoActions, "github/codeql-action");
-
-  initializeEnvironment(Mode.actions, "1.2.3");
-
-  // isRunningLocalAction() === true
-  delete process.env["GITHUB_ACTION_REPOSITORY"];
-  process.env["RUNNER_TEMP"] = path.dirname(__dirname);
-  const repoLocalRunner = codeql.getCodeQLActionRepository(logger);
-  t.deepEqual(repoLocalRunner, "github/codeql-action");
-
-  process.env["GITHUB_ACTION_REPOSITORY"] = "xxx/yyy";
-  const repoEnv = codeql.getCodeQLActionRepository(logger);
-  t.deepEqual(repoEnv, "xxx/yyy");
-});
-
-test("databaseInterpretResults() does not set --sarif-add-query-help for 2.7.0", async (t) => {
-  const runnerConstructorStub = stubToolRunnerConstructor();
-  const codeqlObject = await codeql.getCodeQLForTesting();
-  sinon.stub(codeqlObject, "getVersion").resolves("2.7.0");
-  await codeqlObject.databaseInterpretResults("", [], "", "", "", "-v", "");
-  t.false(
-    runnerConstructorStub.firstCall.args[1].includes("--sarif-add-query-help"),
-    "--sarif-add-query-help should be absent, but it is present"
-  );
-});
-
-test("databaseInterpretResults() sets --sarif-add-query-help for 2.7.1", async (t) => {
-  const runnerConstructorStub = stubToolRunnerConstructor();
-  const codeqlObject = await codeql.getCodeQLForTesting();
-  sinon.stub(codeqlObject, "getVersion").resolves("2.7.1");
-  await codeqlObject.databaseInterpretResults("", [], "", "", "", "-v", "");
-  t.true(
-    runnerConstructorStub.firstCall.args[1].includes("--sarif-add-query-help"),
-    "--sarif-add-query-help should be present, but it is absent"
-  );
-});
-
-test("databaseInitCluster() without injected codescanning config", async (t) => {
-  await util.withTmpDir(async (tempDir) => {
-    const runnerConstructorStub = stubToolRunnerConstructor();
-    const codeqlObject = await codeql.getCodeQLForTesting();
-    sinon.stub(codeqlObject, "getVersion").resolves("2.8.1");
-
-    const thisStubConfig: Config = {
-      ...stubConfig,
-      tempDir,
-      augmentationProperties: {
-        injectedMlQueries: false,
-        queriesInputCombines: false,
-        packsInputCombines: false,
-      },
-    };
-
-    await codeqlObject.databaseInitCluster(
-      thisStubConfig,
-      "",
-      undefined,
-      undefined,
-      createFeatureFlags([]),
-      getRunnerLogger(true)
-    );
-
-    const args = runnerConstructorStub.firstCall.args[1];
-    // should NOT have used an config file
-    const configArg = args.find((arg: string) =>
-      arg.startsWith("--codescanning-config=")
-    );
-    t.falsy(configArg, "Should have injected a codescanning config");
-  });
 });
 
 // Test macro for ensuring different variants of injected augmented configurations
@@ -482,49 +491,40 @@ const injectedConfigMacro = test.macro({
     t: ExecutionContext<unknown>,
     augmentationProperties: AugmentationProperties,
     configOverride: Partial<Config>,
-    expectedConfig: any
+    expectedConfig: any,
   ) => {
-    const origCODEQL_PASS_CONFIG_TO_CLI = process.env.CODEQL_PASS_CONFIG_TO_CLI;
-    process.env["CODEQL_PASS_CONFIG_TO_CLI"] = "true";
-    try {
-      await util.withTmpDir(async (tempDir) => {
-        const runnerConstructorStub = stubToolRunnerConstructor();
-        const codeqlObject = await codeql.getCodeQLForTesting();
-        sinon
-          .stub(codeqlObject, "getVersion")
-          .resolves(codeql.CODEQL_VERSION_CONFIG_FILES);
+    await util.withTmpDir(async (tempDir) => {
+      const runnerConstructorStub = stubToolRunnerConstructor();
+      const codeqlObject = await codeql.getCodeQLForTesting();
+      sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("1.0.0"));
 
-        const thisStubConfig: Config = {
-          ...stubConfig,
-          ...configOverride,
-          tempDir,
-          augmentationProperties,
-        };
+      const thisStubConfig: Config = {
+        ...stubConfig,
+        ...configOverride,
+        tempDir,
+        augmentationProperties,
+      };
 
-        await codeqlObject.databaseInitCluster(
-          thisStubConfig,
-          "",
-          undefined,
-          undefined,
-          createFeatureFlags([]),
-          getRunnerLogger(true)
-        );
+      await codeqlObject.databaseInitCluster(
+        thisStubConfig,
+        "",
+        undefined,
+        undefined,
+        getRunnerLogger(true),
+      );
 
-        const args = runnerConstructorStub.firstCall.args[1];
-        // should have used an config file
-        const configArg = args.find((arg: string) =>
-          arg.startsWith("--codescanning-config=")
-        );
-        t.truthy(configArg, "Should have injected a codescanning config");
-        const configFile = configArg.split("=")[1];
-        const augmentedConfig = yaml.load(fs.readFileSync(configFile, "utf8"));
-        t.deepEqual(augmentedConfig, expectedConfig);
+      const args = runnerConstructorStub.firstCall.args[1] as string[];
+      // should have used an config file
+      const configArg = args.find((arg: string) =>
+        arg.startsWith("--codescanning-config="),
+      );
+      t.truthy(configArg, "Should have injected a codescanning config");
+      const configFile = configArg!.split("=")[1];
+      const augmentedConfig = yaml.load(fs.readFileSync(configFile, "utf8"));
+      t.deepEqual(augmentedConfig, expectedConfig);
 
-        await del(configFile, { force: true });
-      });
-    } finally {
-      process.env["CODEQL_PASS_CONFIG_TO_CLI"] = origCODEQL_PASS_CONFIG_TO_CLI;
-    }
+      await del(configFile, { force: true });
+    });
   },
 
   title: (providedTitle = "") =>
@@ -535,77 +535,17 @@ test(
   "basic",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: false,
     packsInputCombines: false,
   },
   {},
-  {}
-);
-
-test(
-  "injected ML queries",
-  injectedConfigMacro,
-  {
-    injectedMlQueries: true,
-    queriesInputCombines: false,
-    packsInputCombines: false,
-  },
   {},
-  {
-    packs: ["codeql/javascript-experimental-atm-queries@~0.3.0"],
-  }
-);
-
-test(
-  "injected ML queries with existing packs",
-  injectedConfigMacro,
-  {
-    injectedMlQueries: true,
-    queriesInputCombines: false,
-    packsInputCombines: false,
-  },
-  {
-    originalUserInput: {
-      packs: { javascript: ["codeql/something-else"] },
-    },
-  },
-  {
-    packs: {
-      javascript: [
-        "codeql/something-else",
-        "codeql/javascript-experimental-atm-queries@~0.3.0",
-      ],
-    },
-  }
-);
-
-test(
-  "injected ML queries with existing packs of different language",
-  injectedConfigMacro,
-  {
-    injectedMlQueries: true,
-    queriesInputCombines: false,
-    packsInputCombines: false,
-  },
-  {
-    originalUserInput: {
-      packs: { cpp: ["codeql/something-else"] },
-    },
-  },
-  {
-    packs: {
-      cpp: ["codeql/something-else"],
-      javascript: ["codeql/javascript-experimental-atm-queries@~0.3.0"],
-    },
-  }
 );
 
 test(
   "injected packs from input",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: false,
     packsInputCombines: false,
     packsInput: ["xxx", "yyy"],
@@ -613,14 +553,13 @@ test(
   {},
   {
     packs: ["xxx", "yyy"],
-  }
+  },
 );
 
 test(
   "injected packs from input with existing packs combines",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: false,
     packsInputCombines: true,
     packsInput: ["xxx", "yyy"],
@@ -636,14 +575,13 @@ test(
     packs: {
       cpp: ["codeql/something-else", "xxx", "yyy"],
     },
-  }
+  },
 );
 
 test(
   "injected packs from input with existing packs overrides",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: false,
     packsInputCombines: false,
     packsInput: ["xxx", "yyy"],
@@ -657,28 +595,7 @@ test(
   },
   {
     packs: ["xxx", "yyy"],
-  }
-);
-
-test(
-  "injected packs from input with existing packs overrides and ML model inject",
-  injectedConfigMacro,
-  {
-    injectedMlQueries: true,
-    queriesInputCombines: false,
-    packsInputCombines: false,
-    packsInput: ["xxx", "yyy"],
   },
-  {
-    originalUserInput: {
-      packs: {
-        cpp: ["codeql/something-else"],
-      },
-    },
-  },
-  {
-    packs: ["xxx", "yyy", "codeql/javascript-experimental-atm-queries@~0.3.0"],
-  }
 );
 
 // similar, but with queries
@@ -686,7 +603,6 @@ test(
   "injected queries from input",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: false,
     packsInputCombines: false,
     queriesInput: [{ uses: "xxx" }, { uses: "yyy" }],
@@ -701,14 +617,13 @@ test(
         uses: "yyy",
       },
     ],
-  }
+  },
 );
 
 test(
   "injected queries from input overrides",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: false,
     packsInputCombines: false,
     queriesInput: [{ uses: "xxx" }, { uses: "yyy" }],
@@ -727,14 +642,13 @@ test(
         uses: "yyy",
       },
     ],
-  }
+  },
 );
 
 test(
   "injected queries from input combines",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: true,
     packsInputCombines: false,
     queriesInput: [{ uses: "xxx" }, { uses: "yyy" }],
@@ -756,14 +670,13 @@ test(
         uses: "yyy",
       },
     ],
-  }
+  },
 );
 
 test(
   "injected queries from input combines 2",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: true,
     packsInputCombines: true,
     queriesInput: [{ uses: "xxx" }, { uses: "yyy" }],
@@ -778,14 +691,13 @@ test(
         uses: "yyy",
       },
     ],
-  }
+  },
 );
 
 test(
   "injected queries and packs, but empty",
   injectedConfigMacro,
   {
-    injectedMlQueries: false,
     queriesInputCombines: true,
     packsInputCombines: true,
     queriesInput: [],
@@ -797,47 +709,341 @@ test(
       queries: [],
     },
   },
-  {}
+  {},
 );
 
-test("does not use injected config", async (t: ExecutionContext<unknown>) => {
-  const origCODEQL_PASS_CONFIG_TO_CLI = process.env.CODEQL_PASS_CONFIG_TO_CLI;
-  process.env["CODEQL_PASS_CONFIG_TO_CLI"] = "false";
-
-  try {
+test("passes a code scanning config AND qlconfig to the CLI", async (t: ExecutionContext<unknown>) => {
+  await util.withTmpDir(async (tempDir) => {
     const runnerConstructorStub = stubToolRunnerConstructor();
     const codeqlObject = await codeql.getCodeQLForTesting();
-    sinon
-      .stub(codeqlObject, "getVersion")
-      .resolves(codeql.CODEQL_VERSION_CONFIG_FILES);
+    sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
 
     await codeqlObject.databaseInitCluster(
-      stubConfig,
+      { ...stubConfig, tempDir },
       "",
       undefined,
-      undefined,
-      createFeatureFlags([]),
-      getRunnerLogger(true)
+      "/path/to/qlconfig.yml",
+      getRunnerLogger(true),
     );
 
-    const args = runnerConstructorStub.firstCall.args[1];
-    // should have used an config file
-    const configArg = args.find((arg: string) =>
-      arg.startsWith("--codescanning-config=")
+    const args = runnerConstructorStub.firstCall.args[1] as string[];
+    // should have used a config file
+    const hasCodeScanningConfigArg = args.some((arg: string) =>
+      arg.startsWith("--codescanning-config="),
     );
-    t.falsy(configArg, "Should NOT have injected a codescanning config");
-  } finally {
-    process.env["CODEQL_PASS_CONFIG_TO_CLI"] = origCODEQL_PASS_CONFIG_TO_CLI;
-  }
+    t.true(hasCodeScanningConfigArg, "Should have injected a qlconfig");
+
+    // should have passed a qlconfig file
+    const hasQlconfigArg = args.some((arg: string) =>
+      arg.startsWith("--qlconfig-file="),
+    );
+    t.truthy(hasQlconfigArg, "Should have injected a codescanning config");
+  });
 });
 
-export function stubToolRunnerConstructor(): sinon.SinonStub<
-  any[],
-  toolrunner.ToolRunner
-> {
+test("does not pass a qlconfig to the CLI when it is undefined", async (t: ExecutionContext<unknown>) => {
+  await util.withTmpDir(async (tempDir) => {
+    const runnerConstructorStub = stubToolRunnerConstructor();
+    const codeqlObject = await codeql.getCodeQLForTesting();
+    sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
+
+    await codeqlObject.databaseInitCluster(
+      { ...stubConfig, tempDir },
+      "",
+      undefined,
+      undefined, // undefined qlconfigFile
+      getRunnerLogger(true),
+    );
+
+    const args = runnerConstructorStub.firstCall.args[1] as any[];
+    const hasQlconfigArg = args.some((arg: string) =>
+      arg.startsWith("--qlconfig-file="),
+    );
+    t.false(hasQlconfigArg, "should NOT have injected a qlconfig");
+  });
+});
+
+const NEW_ANALYSIS_SUMMARY_TEST_CASES = [
+  {
+    codeqlVersion: makeVersionInfo("2.15.0", {
+      [ToolsFeature.AnalysisSummaryV2IsDefault]: true,
+    }),
+    githubVersion: {
+      type: util.GitHubVariant.DOTCOM,
+    },
+    flagPassed: false,
+    negativeFlagPassed: false,
+  },
+  {
+    codeqlVersion: makeVersionInfo("2.15.0"),
+    githubVersion: {
+      type: util.GitHubVariant.DOTCOM,
+    },
+    flagPassed: true,
+    negativeFlagPassed: false,
+  },
+  {
+    codeqlVersion: makeVersionInfo("2.15.0"),
+    githubVersion: {
+      type: util.GitHubVariant.GHES,
+      version: "3.10.0",
+    },
+    flagPassed: true,
+    negativeFlagPassed: false,
+  },
+];
+
+for (const {
+  codeqlVersion,
+  flagPassed,
+  githubVersion,
+  negativeFlagPassed,
+} of NEW_ANALYSIS_SUMMARY_TEST_CASES) {
+  test(`database interpret-results passes ${
+    flagPassed
+      ? "--new-analysis-summary"
+      : negativeFlagPassed
+        ? "--no-new-analysis-summary"
+        : "nothing"
+  } for CodeQL version ${JSON.stringify(codeqlVersion)} and ${
+    util.GitHubVariant[githubVersion.type]
+  } ${githubVersion.version ? ` ${githubVersion.version}` : ""}`, async (t) => {
+    const runnerConstructorStub = stubToolRunnerConstructor();
+    const codeqlObject = await codeql.getCodeQLForTesting();
+    sinon.stub(codeqlObject, "getVersion").resolves(codeqlVersion);
+    // io throws because of the test CodeQL object.
+    sinon.stub(io, "which").resolves("");
+    await codeqlObject.databaseInterpretResults(
+      "",
+      [],
+      "",
+      "",
+      "",
+      "-v",
+      undefined,
+      "",
+      Object.assign({}, stubConfig, { gitHubVersion: githubVersion }),
+      createFeatures([]),
+    );
+    const actualArgs = runnerConstructorStub.firstCall.args[1] as string[];
+    t.is(
+      actualArgs.includes("--new-analysis-summary"),
+      flagPassed,
+      `--new-analysis-summary should${flagPassed ? "" : "n't"} be passed`,
+    );
+    t.is(
+      actualArgs.includes("--no-new-analysis-summary"),
+      negativeFlagPassed,
+      `--no-new-analysis-summary should${
+        negativeFlagPassed ? "" : "n't"
+      } be passed`,
+    );
+  });
+}
+
+test("runTool summarizes several fatal errors", async (t) => {
+  const heapError =
+    "A fatal error occurred: Evaluator heap must be at least 384.00 MiB";
+  const datasetImportError =
+    "A fatal error occurred: Dataset import for /home/runner/work/_temp/codeql_databases/javascript/db-javascript failed with code 2";
+  const cliStderr =
+    `Running TRAP import for CodeQL database at /home/runner/work/_temp/codeql_databases/javascript...\n` +
+    `${heapError}\n${datasetImportError}.`;
+  stubToolRunnerConstructor(32, cliStderr);
+  const codeqlObject = await codeql.getCodeQLForTesting();
+  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
+  // io throws because of the test CodeQL object.
+  sinon.stub(io, "which").resolves("");
+
+  await t.throwsAsync(
+    async () =>
+      await codeqlObject.finalizeDatabase(
+        "db",
+        "--threads=2",
+        "--ram=2048",
+        false,
+      ),
+    {
+      instanceOf: util.ConfigurationError,
+      message: new RegExp(
+        'Encountered a fatal error while running \\"codeql-for-testing database finalize --finalize-dataset --threads=2 --ram=2048 db\\"\\. ' +
+          `Exit code was 32 and error was: ${datasetImportError.replaceAll(
+            ".",
+            "\\.",
+          )}\\. Context: ${heapError.replaceAll(
+            ".",
+            "\\.",
+          )}\\. See the logs for more details\\.`,
+      ),
+    },
+  );
+});
+
+test("runTool summarizes autobuilder errors", async (t) => {
+  const stderr = `
+    [2019-09-18 12:00:00] [autobuild] A non-error message
+    [2019-09-18 12:00:00] Untagged message
+    [2019-09-18 12:00:00] [autobuild] [ERROR] Start of the error message
+    [2019-09-18 12:00:00] [autobuild] An interspersed non-error message
+    [2019-09-18 12:00:01] [autobuild] [ERROR]   Some more context about the error message
+    [2019-09-18 12:00:01] [autobuild] [ERROR]   continued
+    [2019-09-18 12:00:01] [autobuild] [ERROR]   and finished here.
+    [2019-09-18 12:00:01] [autobuild] A non-error message
+  `;
+  stubToolRunnerConstructor(1, stderr);
+  const codeqlObject = await codeql.getCodeQLForTesting();
+  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
+  sinon.stub(codeqlObject, "resolveExtractor").resolves("/path/to/extractor");
+  // io throws because of the test CodeQL object.
+  sinon.stub(io, "which").resolves("");
+
+  await t.throwsAsync(
+    async () => await codeqlObject.runAutobuild(stubConfig, Language.java),
+    {
+      instanceOf: util.ConfigurationError,
+      message:
+        "We were unable to automatically build your code. Please provide manual build steps. " +
+        `See ${DocUrl.AUTOMATIC_BUILD_FAILED} for more information. ` +
+        "Encountered the following error: Start of the error message\n" +
+        "  Some more context about the error message\n" +
+        "  continued\n" +
+        "  and finished here.",
+    },
+  );
+});
+
+test("runTool truncates long autobuilder errors", async (t) => {
+  const stderr = Array.from(
+    { length: 20 },
+    (_, i) => `[2019-09-18 12:00:00] [autobuild] [ERROR] line${i + 1}`,
+  ).join("\n");
+  stubToolRunnerConstructor(1, stderr);
+  const codeqlObject = await codeql.getCodeQLForTesting();
+  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
+  sinon.stub(codeqlObject, "resolveExtractor").resolves("/path/to/extractor");
+  // io throws because of the test CodeQL object.
+  sinon.stub(io, "which").resolves("");
+
+  await t.throwsAsync(
+    async () => await codeqlObject.runAutobuild(stubConfig, Language.java),
+    {
+      instanceOf: util.ConfigurationError,
+      message:
+        "We were unable to automatically build your code. Please provide manual build steps. " +
+        `See ${DocUrl.AUTOMATIC_BUILD_FAILED} for more information. ` +
+        "Encountered the following error: " +
+        `${Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join(
+          "\n",
+        )}\n(truncated)`,
+    },
+  );
+});
+
+test("runTool recognizes fatal internal errors", async (t) => {
+  const stderr = `
+    [11/31 eval 8m19s] Evaluation done; writing results to codeql/go-queries/Security/CWE-020/MissingRegexpAnchor.bqrs.
+    Oops! A fatal internal error occurred. Details:
+    com.semmle.util.exception.CatastrophicError: An error occurred while evaluating ControlFlowGraph::ControlFlow::Root.isRootOf/1#dispred#f610e6ed/2@86282cc8
+    Severe disk cache trouble (corruption or out of space) at /home/runner/work/_temp/codeql_databases/go/db-go/default/cache/pages/28/33.pack: Failed to write item to disk`;
+  stubToolRunnerConstructor(1, stderr);
+  const codeqlObject = await codeql.getCodeQLForTesting();
+  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
+  sinon.stub(codeqlObject, "resolveExtractor").resolves("/path/to/extractor");
+  // io throws because of the test CodeQL object.
+  sinon.stub(io, "which").resolves("");
+
+  await t.throwsAsync(
+    async () =>
+      await codeqlObject.databaseRunQueries(stubConfig.dbLocation, []),
+    {
+      instanceOf: CliError,
+      message: `Encountered a fatal error while running "codeql-for-testing database run-queries  --expect-discarded-cache --intra-layer-parallelism --min-disk-free=1024 -v". Exit code was 1 and error was: Oops! A fatal internal error occurred. Details:
+    com.semmle.util.exception.CatastrophicError: An error occurred while evaluating ControlFlowGraph::ControlFlow::Root.isRootOf/1#dispred#f610e6ed/2@86282cc8
+    Severe disk cache trouble (corruption or out of space) at /home/runner/work/_temp/codeql_databases/go/db-go/default/cache/pages/28/33.pack: Failed to write item to disk. See the logs for more details.`,
+    },
+  );
+});
+
+test("runTool outputs last line of stderr if fatal error could not be found", async (t) => {
+  const cliStderr = "line1\nline2\nline3\nline4\nline5";
+  stubToolRunnerConstructor(32, cliStderr);
+  const codeqlObject = await codeql.getCodeQLForTesting();
+  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
+  // io throws because of the test CodeQL object.
+  sinon.stub(io, "which").resolves("");
+
+  await t.throwsAsync(
+    async () =>
+      await codeqlObject.finalizeDatabase(
+        "db",
+        "--threads=2",
+        "--ram=2048",
+        false,
+      ),
+    {
+      instanceOf: util.ConfigurationError,
+      message: new RegExp(
+        'Encountered a fatal error while running \\"codeql-for-testing database finalize --finalize-dataset --threads=2 --ram=2048 db\\"\\. ' +
+          "Exit code was 32 and last log line was: line5\\. See the logs for more details\\.",
+      ),
+    },
+  );
+});
+
+test("Avoids duplicating --overwrite flag if specified in CODEQL_ACTION_EXTRA_OPTIONS", async (t) => {
+  const runnerConstructorStub = stubToolRunnerConstructor();
+  const codeqlObject = await codeql.getCodeQLForTesting();
+  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
+  // io throws because of the test CodeQL object.
+  sinon.stub(io, "which").resolves("");
+
+  process.env["CODEQL_ACTION_EXTRA_OPTIONS"] =
+    '{ "database": { "init": ["--overwrite"] } }';
+
+  await codeqlObject.databaseInitCluster(
+    stubConfig,
+    "sourceRoot",
+    undefined,
+    undefined,
+    getRunnerLogger(false),
+  );
+
+  t.true(runnerConstructorStub.calledOnce);
+  const args = runnerConstructorStub.firstCall.args[1] as string[];
+  t.is(
+    args.filter((option: string) => option === "--overwrite").length,
+    1,
+    "--overwrite should only be passed once",
+  );
+
+  // Clean up
+  const configArg = args.find((arg: string) =>
+    arg.startsWith("--codescanning-config="),
+  );
+  t.truthy(configArg, "Should have injected a codescanning config");
+  const configFile = configArg!.split("=")[1];
+  await del(configFile, { force: true });
+});
+
+export function stubToolRunnerConstructor(
+  exitCode: number = 0,
+  stderr?: string,
+): sinon.SinonStub<any[], toolrunner.ToolRunner> {
   const runnerObjectStub = sinon.createStubInstance(toolrunner.ToolRunner);
-  runnerObjectStub.exec.resolves(0);
-  const runnerConstructorStub = sinon.stub(toolrunner, "ToolRunner");
-  runnerConstructorStub.returns(runnerObjectStub);
+  const runnerConstructorStub = sinon.stub(
+    toolrunner,
+    "ToolRunner",
+  ) as sinon.SinonStub<any[], toolrunner.ToolRunner>;
+  let stderrListener: ((data: Buffer) => void) | undefined = undefined;
+  runnerConstructorStub.callsFake((_cmd, _args, options: ExecOptions) => {
+    stderrListener = options.listeners?.stderr;
+    return runnerObjectStub;
+  });
+  runnerObjectStub.exec.callsFake(async () => {
+    if (stderrListener !== undefined && stderr !== undefined) {
+      stderrListener(Buffer.from(stderr));
+    }
+    return exitCode;
+  });
   return runnerConstructorStub;
 }

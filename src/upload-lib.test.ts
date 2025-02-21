@@ -3,130 +3,91 @@ import * as path from "path";
 
 import test from "ava";
 
-import { getRunnerLogger } from "./logging";
+import { getRunnerLogger, Logger } from "./logging";
 import { setupTests } from "./testing-utils";
 import * as uploadLib from "./upload-lib";
-import {
-  initializeEnvironment,
-  Mode,
-  GitHubVersion,
-  GitHubVariant,
-  withTmpDir,
-} from "./util";
+import { GitHubVariant, initializeEnvironment, withTmpDir } from "./util";
 
 setupTests(test);
 
 test.beforeEach(() => {
-  initializeEnvironment(Mode.actions, "1.2.3");
+  initializeEnvironment("1.2.3");
 });
 
 test("validateSarifFileSchema - valid", (t) => {
   const inputFile = `${__dirname}/../src/testdata/valid-sarif.sarif`;
   t.notThrows(() =>
-    uploadLib.validateSarifFileSchema(inputFile, getRunnerLogger(true))
+    uploadLib.validateSarifFileSchema(inputFile, getRunnerLogger(true)),
   );
 });
 
 test("validateSarifFileSchema - invalid", (t) => {
   const inputFile = `${__dirname}/../src/testdata/invalid-sarif.sarif`;
   t.throws(() =>
-    uploadLib.validateSarifFileSchema(inputFile, getRunnerLogger(true))
+    uploadLib.validateSarifFileSchema(inputFile, getRunnerLogger(true)),
   );
 });
 
-test("validate correct payload used per version", async (t) => {
-  const newVersions: GitHubVersion[] = [
-    { type: GitHubVariant.DOTCOM },
-    { type: GitHubVariant.GHES, version: "3.1.0" },
-  ];
-  const oldVersions: GitHubVersion[] = [
-    { type: GitHubVariant.GHES, version: "2.22.1" },
-    { type: GitHubVariant.GHES, version: "3.0.0" },
-  ];
-  const allVersions = newVersions.concat(oldVersions);
-
+test("validate correct payload used for push, PR merge commit, and PR head", async (t) => {
   process.env["GITHUB_EVENT_NAME"] = "push";
-  for (const version of allVersions) {
-    const payload: any = uploadLib.buildPayload(
-      "commit",
-      "refs/heads/master",
-      "key",
-      undefined,
-      "",
-      undefined,
-      "/opt/src",
-      undefined,
-      ["CodeQL", "eslint"],
-      version,
-      "mergeBaseCommit"
-    );
-    // Not triggered by a pull request
-    t.falsy(payload.base_ref);
-    t.falsy(payload.base_sha);
-  }
+  const pushPayload: any = uploadLib.buildPayload(
+    "commit",
+    "refs/heads/master",
+    "key",
+    undefined,
+    "",
+    1234,
+    1,
+    "/opt/src",
+    undefined,
+    ["CodeQL", "eslint"],
+    "mergeBaseCommit",
+  );
+  // Not triggered by a pull request
+  t.falsy(pushPayload.base_ref);
+  t.falsy(pushPayload.base_sha);
 
   process.env["GITHUB_EVENT_NAME"] = "pull_request";
   process.env["GITHUB_SHA"] = "commit";
   process.env["GITHUB_BASE_REF"] = "master";
-  process.env[
-    "GITHUB_EVENT_PATH"
-  ] = `${__dirname}/../src/testdata/pull_request.json`;
-  for (const version of newVersions) {
-    const payload: any = uploadLib.buildPayload(
-      "commit",
-      "refs/pull/123/merge",
-      "key",
-      undefined,
-      "",
-      undefined,
-      "/opt/src",
-      undefined,
-      ["CodeQL", "eslint"],
-      version,
-      "mergeBaseCommit"
-    );
-    // Uploads for a merge commit use the merge base
-    t.deepEqual(payload.base_ref, "refs/heads/master");
-    t.deepEqual(payload.base_sha, "mergeBaseCommit");
-  }
+  process.env["GITHUB_EVENT_PATH"] =
+    `${__dirname}/../src/testdata/pull_request.json`;
+  const prMergePayload: any = uploadLib.buildPayload(
+    "commit",
+    "refs/pull/123/merge",
+    "key",
+    undefined,
+    "",
+    1234,
+    1,
+    "/opt/src",
+    undefined,
+    ["CodeQL", "eslint"],
+    "mergeBaseCommit",
+  );
+  // Uploads for a merge commit use the merge base
+  t.deepEqual(prMergePayload.base_ref, "refs/heads/master");
+  t.deepEqual(prMergePayload.base_sha, "mergeBaseCommit");
 
-  for (const version of newVersions) {
-    const payload: any = uploadLib.buildPayload(
-      "headCommit",
-      "refs/pull/123/head",
-      "key",
-      undefined,
-      "",
-      undefined,
-      "/opt/src",
-      undefined,
-      ["CodeQL", "eslint"],
-      version,
-      "mergeBaseCommit"
-    );
-    // Uploads for the head use the PR base
-    t.deepEqual(payload.base_ref, "refs/heads/master");
-    t.deepEqual(payload.base_sha, "f95f852bd8fca8fcc58a9a2d6c842781e32a215e");
-  }
-
-  for (const version of oldVersions) {
-    const payload: any = uploadLib.buildPayload(
-      "commit",
-      "refs/pull/123/merge",
-      "key",
-      undefined,
-      "",
-      undefined,
-      "/opt/src",
-      undefined,
-      ["CodeQL", "eslint"],
-      version,
-      "mergeBaseCommit"
-    );
-    // These older versions won't expect these values
-    t.falsy(payload.base_ref);
-    t.falsy(payload.base_sha);
-  }
+  const prHeadPayload: any = uploadLib.buildPayload(
+    "headCommit",
+    "refs/pull/123/head",
+    "key",
+    undefined,
+    "",
+    1234,
+    1,
+    "/opt/src",
+    undefined,
+    ["CodeQL", "eslint"],
+    "mergeBaseCommit",
+  );
+  // Uploads for the head use the PR base
+  t.deepEqual(prHeadPayload.base_ref, "refs/heads/master");
+  t.deepEqual(
+    prHeadPayload.base_sha,
+    "f95f852bd8fca8fcc58a9a2d6c842781e32a215e",
+  );
 });
 
 test("finding SARIF files", async (t) => {
@@ -150,7 +111,7 @@ test("finding SARIF files", async (t) => {
     fs.symlinkSync(
       path.join(tmpDir, "a.sarif"),
       path.join(tmpDir, "dir3", "symlink2.sarif"),
-      "file"
+      "file",
     );
 
     const sarifFiles = uploadLib.findSarifFilesInDir(tmpDir);
@@ -179,7 +140,7 @@ test("populateRunAutomationDetails", (t) => {
     sarif,
     "language:javascript/os:linux",
     analysisKey,
-    '{"language": "other", "os": "other"}'
+    '{"language": "other", "os": "other"}',
   );
   t.deepEqual(modifiedSarif, expectedSarif);
 
@@ -188,7 +149,7 @@ test("populateRunAutomationDetails", (t) => {
     sarif,
     "language:javascript/os:linux/",
     analysisKey,
-    ""
+    "",
   );
   t.deepEqual(modifiedSarif, expectedSarif);
 
@@ -199,7 +160,7 @@ test("populateRunAutomationDetails", (t) => {
     sarif,
     undefined,
     analysisKey,
-    '{"os": "linux", "language": "javascript"}'
+    '{"os": "linux", "language": "javascript"}',
   );
   t.deepEqual(modifiedSarif, expectedSarif);
 
@@ -219,7 +180,7 @@ test("populateRunAutomationDetails", (t) => {
     sarif,
     undefined,
     analysisKey,
-    '{"os": "linux", "language": "javascript"}'
+    '{"os": "linux", "language": "javascript"}',
   );
   t.deepEqual(modifiedSarif, expectedSarif);
 });
@@ -240,7 +201,7 @@ test("validateUniqueCategory for automation details id", (t) => {
   // Our category sanitization is not perfect. Here are some examples
   // of where we see false clashes
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc/def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc/def")),
   );
   t.throws(() => uploadLib.validateUniqueCategory(createMockSarif("abc@def")));
   t.throws(() => uploadLib.validateUniqueCategory(createMockSarif("abc_def")));
@@ -248,69 +209,69 @@ test("validateUniqueCategory for automation details id", (t) => {
 
   // this one is fine
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc_ def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc_ def")),
   );
 });
 
 test("validateUniqueCategory for tool name", (t) => {
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "AbC"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "AbC")),
   );
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "def")),
   );
 
   // Our category sanitization is not perfect. Here are some examples
   // of where we see false clashes
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc/def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc/def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc@def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc@def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc_def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc_def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc def"))
+    uploadLib.validateUniqueCategory(createMockSarif(undefined, "abc def")),
   );
 
   // this one is fine
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc_ def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc_ def")),
   );
 });
 
 test("validateUniqueCategory for automation details id and tool name", (t) => {
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc", "abc"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc", "abc")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc", "abc"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc", "abc")),
   );
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc_", "def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc_", "def")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc_", "def"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc_", "def")),
   );
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("ghi", "_jkl"))
+    uploadLib.validateUniqueCategory(createMockSarif("ghi", "_jkl")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("ghi", "_jkl"))
+    uploadLib.validateUniqueCategory(createMockSarif("ghi", "_jkl")),
   );
 
   // Our category sanitization is not perfect. Here are some examples
@@ -319,15 +280,15 @@ test("validateUniqueCategory for automation details id and tool name", (t) => {
   t.throws(() => uploadLib.validateUniqueCategory(createMockSarif("abc", "_")));
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("abc", "def__"))
+    uploadLib.validateUniqueCategory(createMockSarif("abc", "def__")),
   );
   t.throws(() => uploadLib.validateUniqueCategory(createMockSarif("abc_def")));
 
   t.notThrows(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("mno_", "pqr"))
+    uploadLib.validateUniqueCategory(createMockSarif("mno_", "pqr")),
   );
   t.throws(() =>
-    uploadLib.validateUniqueCategory(createMockSarif("mno", "_pqr"))
+    uploadLib.validateUniqueCategory(createMockSarif("mno", "_pqr")),
   );
 });
 
@@ -342,6 +303,106 @@ test("validateUniqueCategory for multiple runs", (t) => {
   // should throw if there are duplicate categories in separate validations
   t.throws(() => uploadLib.validateUniqueCategory(sarif1));
   t.throws(() => uploadLib.validateUniqueCategory(sarif2));
+});
+
+test("accept results with invalid artifactLocation.uri value", (t) => {
+  const loggedMessages: string[] = [];
+  const mockLogger = {
+    info: (message: string) => {
+      loggedMessages.push(message);
+    },
+  } as Logger;
+
+  const sarifFile = `${__dirname}/../src/testdata/with-invalid-uri.sarif`;
+  uploadLib.validateSarifFileSchema(sarifFile, mockLogger);
+
+  t.deepEqual(loggedMessages.length, 3);
+  t.deepEqual(
+    loggedMessages[1],
+    "Warning: 'not a valid URI' is not a valid URI in 'instance.runs[0].tool.driver.rules[0].helpUri'.",
+    "Warning: 'not a valid URI' is not a valid URI in 'instance.runs[0].results[0].locations[0].physicalLocation.artifactLocation.uri'.",
+  );
+});
+
+test("shouldShowCombineSarifFilesDeprecationWarning when on dotcom", async (t) => {
+  t.true(
+    await uploadLib.shouldShowCombineSarifFilesDeprecationWarning(
+      [createMockSarif("abc", "def"), createMockSarif("abc", "def")],
+      {
+        type: GitHubVariant.DOTCOM,
+      },
+    ),
+  );
+});
+
+test("shouldShowCombineSarifFilesDeprecationWarning when on GHES 3.13", async (t) => {
+  t.false(
+    await uploadLib.shouldShowCombineSarifFilesDeprecationWarning(
+      [createMockSarif("abc", "def"), createMockSarif("abc", "def")],
+      {
+        type: GitHubVariant.GHES,
+        version: "3.13.2",
+      },
+    ),
+  );
+});
+
+test("shouldShowCombineSarifFilesDeprecationWarning when on GHES 3.14", async (t) => {
+  t.true(
+    await uploadLib.shouldShowCombineSarifFilesDeprecationWarning(
+      [createMockSarif("abc", "def"), createMockSarif("abc", "def")],
+      {
+        type: GitHubVariant.GHES,
+        version: "3.14.0",
+      },
+    ),
+  );
+});
+
+test("shouldShowCombineSarifFilesDeprecationWarning with only 1 run", async (t) => {
+  t.false(
+    await uploadLib.shouldShowCombineSarifFilesDeprecationWarning(
+      [createMockSarif("abc", "def")],
+      {
+        type: GitHubVariant.DOTCOM,
+      },
+    ),
+  );
+});
+
+test("shouldShowCombineSarifFilesDeprecationWarning with distinct categories", async (t) => {
+  t.false(
+    await uploadLib.shouldShowCombineSarifFilesDeprecationWarning(
+      [createMockSarif("abc", "def"), createMockSarif("def", "def")],
+      {
+        type: GitHubVariant.DOTCOM,
+      },
+    ),
+  );
+});
+
+test("shouldShowCombineSarifFilesDeprecationWarning with distinct tools", async (t) => {
+  t.false(
+    await uploadLib.shouldShowCombineSarifFilesDeprecationWarning(
+      [createMockSarif("abc", "abc"), createMockSarif("abc", "def")],
+      {
+        type: GitHubVariant.DOTCOM,
+      },
+    ),
+  );
+});
+
+test("shouldShowCombineSarifFilesDeprecationWarning when environment variable is already set", async (t) => {
+  process.env["CODEQL_MERGE_SARIF_DEPRECATION_WARNING"] = "true";
+
+  t.false(
+    await uploadLib.shouldShowCombineSarifFilesDeprecationWarning(
+      [createMockSarif("abc", "def"), createMockSarif("abc", "def")],
+      {
+        type: GitHubVariant.DOTCOM,
+      },
+    ),
+  );
 });
 
 function createMockSarif(id?: string, tool?: string) {

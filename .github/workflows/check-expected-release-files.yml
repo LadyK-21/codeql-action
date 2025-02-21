@@ -13,9 +13,12 @@ jobs:
   check-expected-release-files:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout CodeQL Action
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Check Expected Release Files
         run: |
           bundle_version="$(cat "./src/defaults.json" | jq -r ".bundleVersion")"

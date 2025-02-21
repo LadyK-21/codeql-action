@@ -1,8 +1,9 @@
-# This workflow runs after a release of the action. For v2 releases, it merges any changes from the
-# release back into the main branch. Typically, this is just a single commit that updates the
-# changelog. For v2 and v1 releases, it then (a) tags the merge commit on the release branch that
-# represents the new release with an `vx.y.z` tag and (b) updates the `vx` tag to refer to this
-# commit.
+# This workflow runs after a merge to any release branch of the action. It:
+# 1. Tags the merge commit on the release branch that represents the new release with an `vN.x.y`
+#    tag
+# 2. Updates the `vN` tag to refer to this merge commit.
+# 3. Iff vN == vLatest, merges any changes from the release back into the main branch.
+#    Typically, this is two commits – one to update the version number and one to update dependencies.
 name: Tag release and merge back
 
 on:
@@ -15,16 +16,20 @@ on:
 
   push:
     branches:
-      - releases/v1
-      - releases/v2
+      - releases/v*
 
 jobs:
   merge-back:
     runs-on: ubuntu-latest
+    environment: Automation
     if: github.repository == 'github/codeql-action'
     env:
       BASE_BRANCH: "${{ github.event.inputs.baseBranch || 'main' }}"
       HEAD_BRANCH: "${{ github.head_ref || github.ref }}"
+
+    permissions:
+      contents: write # needed to create tags and push commits
+      pull-requests: write
 
     steps:
       - name: Dump environment
@@ -35,23 +40,26 @@ jobs:
           GITHUB_CONTEXT: '${{ toJson(github) }}'
         run: echo "${GITHUB_CONTEXT}"
 
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # ensure we have all tags and can push commits
+      - uses: actions/setup-node@v4
 
       - name: Update git config
         run: |
-          git config --global user.email "github-actions@github.com"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
       - name: Get version and new branch
         id: getVersion
         run: |
           VERSION="v$(jq '.version' -r 'package.json')"
-          echo "::set-output name=version::${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
           short_sha="${GITHUB_SHA:0:8}"
           NEW_BRANCH="mergeback/${VERSION}-to-${BASE_BRANCH}-${short_sha}"
-          echo "::set-output name=newBranch::${NEW_BRANCH}"
-
+          echo "newBranch=${NEW_BRANCH}" >> $GITHUB_OUTPUT
+          LATEST_RELEASE_BRANCH=$(git branch -r | grep -E "origin/releases/v[0-9]+$" | sed 's/origin\///g' | sort -V | tail -1 | xargs)
+          echo "latest_release_branch=${LATEST_RELEASE_BRANCH}" >> $GITHUB_OUTPUT
 
       - name: Dump branches
         env:
@@ -60,6 +68,8 @@ jobs:
           echo "BASE_BRANCH ${BASE_BRANCH}"
           echo "HEAD_BRANCH ${HEAD_BRANCH}"
           echo "NEW_BRANCH ${NEW_BRANCH}"
+          echo "LATEST_RELEASE_BRANCH ${LATEST_RELEASE_BRANCH}"
+          echo "GITHUB_REF ${GITHUB_REF}"
 
       - name: Create mergeback branch
         env:
@@ -77,7 +87,7 @@ jobs:
           exists="$?"
           if [ "${exists}" -eq 0 ]; then
             echo "Tag ${VERSION} exists. Not going to re-release."
-            echo "::set-output name=exists::true"
+            echo "exists=true" >> $GITHUB_OUTPUT
           else
             echo "Tag ${VERSION} does not exist yet."
           fi
@@ -90,8 +100,6 @@ jobs:
         env:
           VERSION: ${{ steps.getVersion.outputs.version }}
         run: |
-          # Unshallow the repo in order to allow pushes
-          git fetch --unshallow
           # Create the `vx.y.z` tag
           git tag --annotate "${VERSION}" --message "${VERSION}"
           # Update the `vx` tag
@@ -100,13 +108,24 @@ jobs:
           git tag --annotate "${major_version_tag}" --message "${major_version_tag}" --force
           # Push the tags, using:
           # - `--atomic` to make sure we either update both tags or neither (an intermediate state,
-          #   e.g. where we update the v2.x.y tag on the remote but not the v2 tag, could result in
-          #   unwanted Dependabot updates, e.g. from v2 to v2.x.y)
-          # - `--force` since we're overwriting the `vx` tag
+          #   e.g. where we update the vN.x.y tag on the remote but not the vN tag, could result in
+          #   unwanted Dependabot updates, e.g. from vN to vN.x.y)
+          # - `--force` since we're overwriting the `vN` tag
           git push origin --atomic --force refs/tags/"${VERSION}" refs/tags/"${major_version_tag}"
 
+      - name: Prepare partial Changelog
+        env:
+          PARTIAL_CHANGELOG: "${{ runner.temp }}/partial_changelog.md"
+          VERSION: "${{ steps.getVersion.outputs.version }}"
+        run: |
+          python .github/workflows/script/prepare_changelog.py CHANGELOG.md "$VERSION" > $PARTIAL_CHANGELOG
+
+          echo "::group::Partial CHANGELOG"
+          cat $PARTIAL_CHANGELOG
+          echo "::endgroup::"
+
       - name: Create mergeback branch
-        if: steps.check.outputs.exists != 'true' && contains(github.ref, 'releases/v2')
+        if: ${{ steps.check.outputs.exists != 'true' && endsWith(github.ref_name, steps.getVersion.outputs.latest_release_branch) }}
         env:
           VERSION: "${{ steps.getVersion.outputs.version }}"
           NEW_BRANCH: "${{ steps.getVersion.outputs.newBranch }}"
@@ -122,15 +141,16 @@ jobs:
             - [ ] Remove and re-add the "Update dependencies" label to the PR to trigger just this workflow.
             - [ ] Wait for the "Update dependencies" workflow to push a commit updating the dependencies.
             - [ ] Mark the PR as ready for review to trigger the full set of PR checks.
-            - [ ] Approve and merge the PR.
+            - [ ] Approve and merge the PR. When merging the PR, make sure "Create a merge commit" is
+                  selected rather than "Squash and merge" or "Rebase and merge".
           EOF
           )
 
           # Update the version number ready for the next release
           npm version patch --no-git-tag-version
 
-          # Update the changelog
-          perl -i -pe 's/^/## \[UNRELEASED\]\n\nNo user facing changes.\n\n/ if($.==3)' CHANGELOG.md
+          # Update the changelog, adding a new version heading directly above the most recent existing one
+          awk '!f && /##/{print "'"## [UNRELEASED]\n\nNo user facing changes.\n"'"; f=1}1' CHANGELOG.md > temp && mv temp CHANGELOG.md
           git add .
           git commit -m "Update changelog and version after ${VERSION}"
 
@@ -146,3 +166,23 @@ jobs:
             --body "${pr_body}" \
             --assignee "${GITHUB_ACTOR}" \
             --draft
+
+      - name: Generate token
+        uses: actions/create-github-app-token@0d564482f06ca65fa9e77e2510873638c82206f2
+        id: app-token
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
+
+      - name: Create the GitHub release
+        env:
+          PARTIAL_CHANGELOG: "${{ runner.temp }}/partial_changelog.md"
+          VERSION: "${{ steps.getVersion.outputs.version }}"
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Do not mark this release as latest. The most recent CLI release must be marked as latest.
+          gh release create \
+            "$VERSION" \
+            --latest=false \
+            --title "$VERSION" \
+            --notes-file "$PARTIAL_CHANGELOG"

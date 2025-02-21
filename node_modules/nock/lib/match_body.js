@@ -43,7 +43,7 @@ module.exports = function matchBody(options, spec, body) {
   }
 
   // strip line endings from both so that we get a match no matter what OS we are running on
-  // if Content-Type does not contains 'multipart'
+  // if Content-Type does not contain 'multipart'
   if (!isMultipart && typeof body === 'string') {
     body = body.replace(/\r?\n|\r/g, '')
   }
@@ -52,13 +52,22 @@ module.exports = function matchBody(options, spec, body) {
     spec = spec.replace(/\r?\n|\r/g, '')
   }
 
-  // Because the nature of URL encoding, all the values in the body have been cast to strings.
-  // dataEqual does strict checking so we we have to cast the non-regexp values in the spec too.
+  // Because the nature of URL encoding, all the values in the body must be cast to strings.
+  // dataEqual does strict checking, so we have to cast the non-regexp values in the spec too.
   if (isUrlencoded) {
     spec = mapValuesDeep(spec, val => (val instanceof RegExp ? val : `${val}`))
   }
 
   return common.dataEqual(spec, body)
+}
+
+function mapValues(object, cb) {
+  const keys = Object.keys(object)
+  const clonedObject = { ...object }
+  for (const key of keys) {
+    clonedObject[key] = cb(clonedObject[key], key, clonedObject)
+  }
+  return clonedObject
 }
 
 /**
@@ -70,7 +79,7 @@ function mapValuesDeep(obj, cb) {
     return obj.map(v => mapValuesDeep(v, cb))
   }
   if (common.isPlainObject(obj)) {
-    return common.mapValue(obj, v => mapValuesDeep(v, cb))
+    return mapValues(obj, v => mapValuesDeep(v, cb))
   }
   return cb(obj)
 }

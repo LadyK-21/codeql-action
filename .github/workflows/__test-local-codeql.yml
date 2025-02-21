@@ -1,6 +1,6 @@
 # Warning: This file is generated automatically, and should not be modified.
 # Instead, please modify the template in the pr-checks directory and run:
-#     pip install ruamel.yaml && python3 sync.py
+#     (cd pr-checks; pip install ruamel.yaml@0.17.31 && python3 sync.py)
 # to regenerate this file.
 
 name: PR Check - Local CodeQL bundle
@@ -10,50 +10,56 @@ env:
 on:
   push:
     branches:
-    - main
-    - releases/v1
-    - releases/v2
+      - main
+      - releases/v*
   pull_request:
     types:
-    - opened
-    - synchronize
-    - reopened
-    - ready_for_review
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  schedule:
+    - cron: '0 5 * * *'
   workflow_dispatch: {}
 jobs:
   test-local-codeql:
     strategy:
+      fail-fast: false
       matrix:
         include:
-        - os: ubuntu-latest
-          version: nightly-latest
+          - os: ubuntu-latest
+            version: nightly-latest
     name: Local CodeQL bundle
+    permissions:
+      contents: read
+      security-events: read
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
-    - name: Check out repository
-      uses: actions/checkout@v3
-    - name: Prepare test
-      id: prepare-test
-      uses: ./.github/prepare-test
-      with:
-        version: ${{ matrix.version }}
-    - name: Fetch a CodeQL bundle
-      shell: bash
-      env:
-        CODEQL_URL: ${{ steps.prepare-test.outputs.tools-url }}
-      run: |
-        wget "$CODEQL_URL"
-    - uses: ./../action/init
-      with:
-        tools: ./codeql-bundle.tar.gz
-      env:
-        TEST_MODE: true
-    - name: Build code
-      shell: bash
-      run: ./build.sh
-    - uses: ./../action/analyze
-      env:
-        TEST_MODE: true
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Prepare test
+        id: prepare-test
+        uses: ./.github/actions/prepare-test
+        with:
+          version: ${{ matrix.version }}
+          use-all-platform-bundle: 'false'
+          setup-kotlin: 'true'
+      - name: Fetch a CodeQL bundle
+        shell: bash
+        env:
+          CODEQL_URL: ${{ steps.prepare-test.outputs.tools-url }}
+        run: |
+          wget "$CODEQL_URL"
+      - id: init
+        uses: ./../action/init
+        with:
+      # Swift is not supported on Ubuntu so we manually exclude it from the list here
+          languages: cpp,csharp,go,java,javascript,python,ruby
+          tools: ./codeql-bundle-linux64.tar.zst
+      - name: Build code
+        shell: bash
+        run: ./build.sh
+      - uses: ./../action/analyze
     env:
-      INTERNAL_CODEQL_ACTION_DEBUG_LOC: true
+      CODEQL_ACTION_TEST_MODE: true

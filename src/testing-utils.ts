@@ -1,11 +1,45 @@
+import { TextDecoder } from "node:util";
+import path from "path";
+
 import * as github from "@actions/github";
 import { TestFn } from "ava";
+import nock from "nock";
 import * as sinon from "sinon";
 
 import * as apiClient from "./api-client";
-import * as CodeQL from "./codeql";
+import { GitHubApiDetails } from "./api-client";
+import * as codeql from "./codeql";
+import { Config } from "./config-utils";
+import * as defaults from "./defaults.json";
+import {
+  CodeQLDefaultVersionInfo,
+  Feature,
+  FeatureEnablement,
+} from "./feature-flags";
 import { Logger } from "./logging";
-import { HTTPError } from "./util";
+import {
+  DEFAULT_DEBUG_ARTIFACT_NAME,
+  DEFAULT_DEBUG_DATABASE_NAME,
+  GitHubVariant,
+  GitHubVersion,
+  HTTPError,
+} from "./util";
+
+export const SAMPLE_DOTCOM_API_DETAILS = {
+  auth: "token",
+  url: "https://github.com",
+  apiURL: "https://api.github.com",
+};
+
+export const SAMPLE_DEFAULT_CLI_VERSION: CodeQLDefaultVersionInfo = {
+  cliVersion: "2.20.0",
+  tagName: "codeql-bundle-v2.20.0",
+};
+
+export const LINKED_CLI_VERSION = {
+  cliVersion: defaults.cliVersion,
+  tagName: defaults.bundleVersion,
+};
 
 type TestContext = {
   stdoutWrite: any;
@@ -22,7 +56,7 @@ function wrapOutput(context: TestContext) {
   return (
     chunk: Uint8Array | string,
     encoding?: string,
-    cb?: (err?: Error) => void
+    cb?: (err?: Error) => void,
   ): boolean => {
     // Work out which method overload we are in
     if (cb === undefined && typeof encoding === "function") {
@@ -52,7 +86,7 @@ export function setupTests(test: TestFn<any>) {
   typedTest.beforeEach((t) => {
     // Set an empty CodeQL object so that all method calls will fail
     // unless the test explicitly sets one up.
-    CodeQL.setCodeQL({});
+    codeql.setCodeQL({});
 
     // Replace stdout and stderr so we can record output during tests
     t.context.testOutput = "";
@@ -67,7 +101,7 @@ export function setupTests(test: TestFn<any>) {
     // environment variable on Windows isn't preserved, i.e. `process.env.PATH`
     // is not the same as `process.env.Path`.
     const pathKeys = Object.keys(process.env).filter(
-      (k) => k.toLowerCase() === "path"
+      (k) => k.toLowerCase() === "path",
     );
     if (pathKeys.length > 0) {
       process.env.PATH = process.env[pathKeys[0]];
@@ -88,6 +122,9 @@ export function setupTests(test: TestFn<any>) {
     if (!t.passed) {
       process.stdout.write(t.context.testOutput);
     }
+
+    // Undo any modifications made by nock
+    nock.cleanAll();
 
     // Undo any modifications made by sinon
     sinon.restore();
@@ -114,18 +151,22 @@ export function getRecordingLogger(messages: LoggedMessage[]): Logger {
   return {
     debug: (message: string) => {
       messages.push({ type: "debug", message });
+      // eslint-disable-next-line no-console
       console.debug(message);
     },
     info: (message: string) => {
       messages.push({ type: "info", message });
+      // eslint-disable-next-line no-console
       console.info(message);
     },
     warning: (message: string | Error) => {
       messages.push({ type: "warning", message });
+      // eslint-disable-next-line no-console
       console.warn(message);
     },
     error: (message: string | Error) => {
       messages.push({ type: "error", message });
+      // eslint-disable-next-line no-console
       console.error(message);
     },
     isDebug: () => true,
@@ -137,7 +178,7 @@ export function getRecordingLogger(messages: LoggedMessage[]): Logger {
 /** Mock the HTTP request to the feature flags enablement API endpoint. */
 export function mockFeatureFlagApiEndpoint(
   responseStatusCode: number,
-  response: { [flagName: string]: boolean }
+  response: { [flagName: string]: boolean },
 ) {
   // Passing an auth token is required, so we just use a dummy value
   const client = github.getOctokit("123");
@@ -145,7 +186,7 @@ export function mockFeatureFlagApiEndpoint(
   const requestSpy = sinon.stub(client, "request");
 
   const optInSpy = requestSpy.withArgs(
-    "GET /repos/:owner/:repo/code-scanning/codeql-action/features"
+    "GET /repos/:owner/:repo/code-scanning/codeql-action/features",
   );
   if (responseStatusCode < 300) {
     optInSpy.resolves({
@@ -159,4 +200,146 @@ export function mockFeatureFlagApiEndpoint(
   }
 
   sinon.stub(apiClient, "getApiClient").value(() => client);
+}
+
+export function mockLanguagesInRepo(languages: string[]) {
+  const mockClient = sinon.stub(apiClient, "getApiClient");
+  const listLanguages = sinon.stub().resolves({
+    status: 200,
+    data: languages.reduce((acc, lang) => {
+      acc[lang] = 1;
+      return acc;
+    }, {}),
+    headers: {},
+    url: "GET /repos/:owner/:repo/languages",
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+  mockClient.returns({
+    rest: {
+      repos: {
+        listLanguages,
+      },
+    },
+  } as any);
+  return listLanguages;
+}
+
+/**
+ * Constructs a `VersionInfo` object for testing purposes only.
+ */
+export const makeVersionInfo = (
+  version: string,
+  features?: { [name: string]: boolean },
+): codeql.VersionInfo => ({
+  version,
+  features,
+});
+
+export function mockCodeQLVersion(
+  version: string,
+  features?: { [name: string]: boolean },
+) {
+  return codeql.setCodeQL({
+    async getVersion() {
+      return makeVersionInfo(version, features);
+    },
+  });
+}
+
+/**
+ * Create a feature enablement instance with the specified set of enabled features.
+ *
+ * This should be only used within tests.
+ */
+export function createFeatures(enabledFeatures: Feature[]): FeatureEnablement {
+  return {
+    getDefaultCliVersion: async () => {
+      throw new Error("not implemented");
+    },
+    getValue: async (feature) => {
+      return enabledFeatures.includes(feature);
+    },
+  };
+}
+
+/**
+ * Mocks the API for downloading the bundle tagged `tagName`.
+ *
+ * @returns the download URL for the bundle. This can be passed to the tools parameter of
+ * `codeql.setupCodeQL`.
+ */
+export function mockBundleDownloadApi({
+  apiDetails = SAMPLE_DOTCOM_API_DETAILS,
+  isPinned,
+  repo = "github/codeql-action",
+  platformSpecific = true,
+  tagName,
+}: {
+  apiDetails?: GitHubApiDetails;
+  isPinned?: boolean;
+  repo?: string;
+  platformSpecific?: boolean;
+  tagName: string;
+}): string {
+  const platform =
+    process.platform === "win32"
+      ? "win64"
+      : process.platform === "linux"
+        ? "linux64"
+        : "osx64";
+
+  const baseUrl = apiDetails?.url ?? "https://example.com";
+
+  const bundleUrls = ["tar.gz", "tar.zst"].map((extension) => {
+    const relativeUrl = apiDetails
+      ? `/${repo}/releases/download/${tagName}/codeql-bundle${
+          platformSpecific ? `-${platform}` : ""
+        }.${extension}`
+      : `/download/${tagName}/codeql-bundle.${extension}`;
+
+    nock(baseUrl)
+      .get(relativeUrl)
+      .replyWithFile(
+        200,
+        path.join(
+          __dirname,
+          `/../src/testdata/codeql-bundle${
+            isPinned ? "-pinned" : ""
+          }.${extension}`,
+        ),
+      );
+    return `${baseUrl}${relativeUrl}`;
+  });
+
+  // Choose an arbitrary URL to return
+  return bundleUrls[0];
+}
+
+export function createTestConfig(overrides: Partial<Config>): Config {
+  return Object.assign(
+    {},
+    {
+      languages: [],
+      buildMode: undefined,
+      originalUserInput: {},
+      tempDir: "",
+      codeQLCmd: "",
+      gitHubVersion: {
+        type: GitHubVariant.DOTCOM,
+      } as GitHubVersion,
+      dbLocation: "",
+      debugMode: false,
+      debugArtifactName: DEFAULT_DEBUG_ARTIFACT_NAME,
+      debugDatabaseName: DEFAULT_DEBUG_DATABASE_NAME,
+      augmentationProperties: {
+        packsInputCombines: false,
+        queriesInputCombines: false,
+      },
+      trapCaches: {},
+      trapCacheDownloadTime: 0,
+      dependencyCachingEnabled: false,
+    },
+    overrides,
+  );
 }

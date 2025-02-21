@@ -1,119 +1,106 @@
+import * as github from "@actions/github";
 import * as githubUtils from "@actions/github/lib/utils";
-import test, { ExecutionContext } from "ava";
+import test from "ava";
 import * as sinon from "sinon";
 
-import { getApiClient } from "./api-client";
+import * as actionsUtil from "./actions-util";
+import * as api from "./api-client";
 import { setupTests } from "./testing-utils";
-import { Mode, initializeEnvironment } from "./util";
-
-// eslint-disable-next-line import/no-commonjs
-const pkg = require("../package.json");
+import * as util from "./util";
 
 setupTests(test);
 
-let pluginStub: sinon.SinonStub;
-let githubStub: sinon.SinonStub;
-
 test.beforeEach(() => {
-  pluginStub = sinon.stub(githubUtils.GitHub, "plugin");
-  githubStub = sinon.stub();
+  util.initializeEnvironment(actionsUtil.getActionVersion());
+});
+
+test("getApiClient", async (t) => {
+  const pluginStub: sinon.SinonStub = sinon.stub(githubUtils.GitHub, "plugin");
+  const githubStub: sinon.SinonStub = sinon.stub();
   pluginStub.returns(githubStub);
-  initializeEnvironment(Mode.actions, pkg.version);
-});
 
-test("Get the client API", async (t) => {
-  doTest(
-    t,
-    {
-      auth: "xyz",
-      externalRepoAuth: "abc",
-      url: "http://hucairz",
-    },
-    undefined,
-    {
-      auth: "token xyz",
-      baseUrl: "http://hucairz/api/v3",
-      userAgent: `CodeQL-Action/${pkg.version}`,
-    }
-  );
-});
+  sinon.stub(actionsUtil, "getRequiredInput").withArgs("token").returns("xyz");
+  const requiredEnvParamStub = sinon.stub(util, "getRequiredEnvParam");
+  requiredEnvParamStub
+    .withArgs("GITHUB_SERVER_URL")
+    .returns("http://github.localhost");
+  requiredEnvParamStub
+    .withArgs("GITHUB_API_URL")
+    .returns("http://api.github.localhost");
 
-test("Get the client API external", async (t) => {
-  doTest(
-    t,
-    {
-      auth: "xyz",
-      externalRepoAuth: "abc",
-      url: "http://hucairz",
-    },
-    { allowExternal: true },
-    {
-      auth: "token abc",
-      baseUrl: "http://hucairz/api/v3",
-      userAgent: `CodeQL-Action/${pkg.version}`,
-    }
-  );
-});
+  api.getApiClient();
 
-test("Get the client API external not present", async (t) => {
-  doTest(
-    t,
-    {
-      auth: "xyz",
-      url: "http://hucairz",
-    },
-    { allowExternal: true },
-    {
-      auth: "token xyz",
-      baseUrl: "http://hucairz/api/v3",
-      userAgent: `CodeQL-Action/${pkg.version}`,
-    }
-  );
-});
-
-test("Get the client API with github url", async (t) => {
-  doTest(
-    t,
-    {
-      auth: "xyz",
-      url: "https://github.com/some/invalid/url",
-    },
-    undefined,
-    {
-      auth: "token xyz",
-      baseUrl: "https://api.github.com",
-      userAgent: `CodeQL-Action/${pkg.version}`,
-    }
-  );
-});
-
-test("Get the API with an API URL directly", async (t) => {
-  doTest(
-    t,
-    {
-      auth: "xyz",
-      url: "http://github.localhost",
-      apiURL: "http://api.github.localhost",
-    },
-    undefined,
-    {
+  t.assert(
+    githubStub.calledOnceWithExactly({
       auth: "token xyz",
       baseUrl: "http://api.github.localhost",
-      userAgent: `CodeQL-Action/${pkg.version}`,
-    }
+      log: sinon.match.any,
+      userAgent: `CodeQL-Action/${actionsUtil.getActionVersion()}`,
+    }),
   );
 });
 
-function doTest(
-  t: ExecutionContext<unknown>,
-  clientArgs: any,
-  clientOptions: any,
-  expected: any
-) {
-  getApiClient(clientArgs, clientOptions);
-
-  const firstCallArgs = githubStub.args[0];
-  // log is a function, so we don't need to test for equality of it
-  delete firstCallArgs[0].log;
-  t.deepEqual(firstCallArgs, [expected]);
+function mockGetMetaVersionHeader(
+  versionHeader: string | undefined,
+): sinon.SinonStub<any, any> {
+  // Passing an auth token is required, so we just use a dummy value
+  const client = github.getOctokit("123");
+  const response = {
+    headers: {
+      "x-github-enterprise-version": versionHeader,
+    },
+  };
+  const spyGetContents = sinon
+    .stub(client.rest.meta, "get")
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+    .resolves(response as any);
+  sinon.stub(api, "getApiClient").value(() => client);
+  return spyGetContents;
 }
+
+test("getGitHubVersion for Dotcom", async (t) => {
+  const apiDetails = {
+    auth: "",
+    url: "https://github.com",
+    apiURL: "",
+  };
+  sinon.stub(api, "getApiDetails").returns(apiDetails);
+  const v = await api.getGitHubVersionFromApi(
+    github.getOctokit("123"),
+    apiDetails,
+  );
+  t.deepEqual(util.GitHubVariant.DOTCOM, v.type);
+});
+
+test("getGitHubVersion for GHES", async (t) => {
+  mockGetMetaVersionHeader("2.0");
+  const v2 = await api.getGitHubVersionFromApi(api.getApiClient(), {
+    auth: "",
+    url: "https://ghe.example.com",
+    apiURL: undefined,
+  });
+  t.deepEqual(
+    { type: util.GitHubVariant.GHES, version: "2.0" } as util.GitHubVersion,
+    v2,
+  );
+});
+
+test("getGitHubVersion for different domain", async (t) => {
+  mockGetMetaVersionHeader(undefined);
+  const v3 = await api.getGitHubVersionFromApi(api.getApiClient(), {
+    auth: "",
+    url: "https://ghe.example.com",
+    apiURL: undefined,
+  });
+  t.deepEqual({ type: util.GitHubVariant.DOTCOM }, v3);
+});
+
+test("getGitHubVersion for GHE_DOTCOM", async (t) => {
+  mockGetMetaVersionHeader("ghe.com");
+  const gheDotcom = await api.getGitHubVersionFromApi(api.getApiClient(), {
+    auth: "",
+    url: "https://foo.ghe.com",
+    apiURL: undefined,
+  });
+  t.deepEqual({ type: util.GitHubVariant.GHE_DOTCOM }, gheDotcom);
+});
