@@ -15,6 +15,11 @@ def main():
 	api_compatibility_data = json.loads(_API_COMPATIBILITY_PATH.read_text())
 
 	releases = json.loads(_RELEASE_FILE_PATH.read_text())
+
+	# Remove GHES version using a previous version numbering scheme.
+	if "11.10" in releases:
+		del releases["11.10"]
+
 	oldest_supported_release = None
 	newest_supported_release = semver.VersionInfo.parse(api_compatibility_data["maximumVersion"] + ".0")
 
@@ -30,7 +35,10 @@ def main():
 
 		if oldest_supported_release is None or release_version < oldest_supported_release:
 			end_of_life_date = datetime.date.fromisoformat(release_data["end"])
-			if end_of_life_date > datetime.date.today():
+			# The GHES version is not actually end of life until the end of the day specified by
+			# `end_of_life_date`. Wait an extra week to be safe.
+			is_end_of_life = datetime.date.today() > end_of_life_date + datetime.timedelta(weeks=1)
+			if not is_end_of_life:
 				oldest_supported_release = release_version
 
 	api_compatibility_data = {

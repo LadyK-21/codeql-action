@@ -4,14 +4,15 @@ on:
   push:
     branches:
     - main
-    - releases/v1
-    - releases/v2
+    - releases/v*
   pull_request:
     types:
     - opened
     - synchronize
     - reopened
     - ready_for_review
+  schedule:
+    - cron: '0 5 * * *'
   workflow_dispatch: {}
 
 jobs:
@@ -19,17 +20,19 @@ jobs:
     name: Query Filters Tests
     timeout-minutes: 45
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # This permission is needed to allow the GitHub Actions workflow to read the contents of the repository.
     steps:
     - name: Check out repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: Prepare test
       id: prepare-test
-      uses: ./.github/prepare-test
+      uses: ./.github/actions/prepare-test
       with:
-        version: latest
+        version: linked
 
     - name: Check SARIF for default queries with Single include, Single exclude
-      uses: ./../action/.github/query-filter-test
+      uses: ./../action/.github/actions/query-filter-test
       with:
         sarif-file:  ${{ runner.temp }}/results/javascript.sarif
         queries-run: js/zipslip
@@ -38,7 +41,7 @@ jobs:
         tools: ${{ steps.prepare-test.outputs.tools-url }}
 
     - name: Check SARIF for query packs with Single include, Single exclude
-      uses: ./../action/.github/query-filter-test
+      uses: ./../action/.github/actions/query-filter-test
       with:
         sarif-file:  ${{ runner.temp }}/results/javascript.sarif
         queries-run: js/zipslip,javascript/example/empty-or-one-block
@@ -47,7 +50,7 @@ jobs:
         tools: ${{ steps.prepare-test.outputs.tools-url }}
 
     - name: Check SARIF for query packs and local queries with Single include, Single exclude
-      uses: ./../action/.github/query-filter-test
+      uses: ./../action/.github/actions/query-filter-test
       with:
         sarif-file:  ${{ runner.temp }}/results/javascript.sarif
         queries-run: js/zipslip,javascript/example/empty-or-one-block,inrepo-javascript-querypack/show-ifs

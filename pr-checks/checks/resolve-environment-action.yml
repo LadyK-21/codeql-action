@@ -1,0 +1,28 @@
+name: "Resolve environment"
+description: "Tests that the resolve-environment action works for Go and JavaScript/TypeScript"
+versions: ["default", "linked", "nightly-latest"]
+steps:
+  - uses: ./../action/init
+    with:
+      languages: go,javascript-typescript
+      tools: ${{ steps.prepare-test.outputs.tools-url }}
+
+  - name: Resolve environment for Go
+    uses: ./../action/resolve-environment
+    id: resolve-environment-go
+    with:
+      language: go
+
+  - name: Fail if Go configuration missing
+    if: (!fromJSON(steps.resolve-environment-go.outputs.environment).configuration.go)
+    run: exit 1
+
+  - name: Resolve environment for JavaScript/TypeScript
+    uses: ./../action/resolve-environment
+    id: resolve-environment-js
+    with:
+      language: javascript-typescript
+
+  - name: Fail if JavaScript/TypeScript configuration present
+    if: fromJSON(steps.resolve-environment-js.outputs.environment).configuration.javascript
+    run: exit 1

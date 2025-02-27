@@ -3,7 +3,7 @@
 const stream = require('stream')
 const util = require('util')
 const zlib = require('zlib')
-const debug = require('debug')('nock.playback_interceptor')
+const { playback_interceptor: debug } = require('./debug')
 const common = require('./common')
 
 function parseJSONRequestBody(req, requestBody) {
@@ -29,7 +29,7 @@ function parseFullReplyResult(response, fullReplyResult) {
 
   if (fullReplyResult.length > 3) {
     throw Error(
-      'The array returned from the .reply callback contains too many values'
+      'The array returned from the .reply callback contains too many values',
     )
   }
 
@@ -79,7 +79,7 @@ class ReadableBuffers extends stream.Readable {
     this.buffers = buffers
   }
 
-  _read(size) {
+  _read(_size) {
     while (this.buffers.length) {
       if (!this.push(this.buffers.shift())) {
         return
@@ -257,7 +257,7 @@ function playbackInterceptor({
     }
 
     response.rawHeaders.push(
-      ...selectDefaultHeaders(response.rawHeaders, defaultHeaders)
+      ...selectDefaultHeaders(response.rawHeaders, defaultHeaders),
     )
 
     // Evaluate functional headers.
@@ -315,7 +315,7 @@ function playbackInterceptor({
 
   // Calling `start` immediately could take the request all the way to the connection delay
   // during a single microtask execution. This setImmediate stalls the playback to ensure the
-  // correct events are emitted first ('socket', 'finish') and any aborts in the in the queue or
+  // correct events are emitted first ('socket', 'finish') and any aborts in the queue or
   // called during a 'finish' listener can be called.
   common.setImmediate(() => {
     if (!common.isRequestDestroyed(req)) {
