@@ -3,26 +3,30 @@ name: Update Supported Enterprise Server Versions
 on:
   schedule:
     - cron: "0 0 * * *"
+  workflow_dispatch:
 
 jobs:
   update-supported-enterprise-server-versions:
     name: Update Supported Enterprise Server Versions
     timeout-minutes: 45
     runs-on: ubuntu-latest
-    if: ${{ github.repository == 'github/codeql-action' }}
+    if: github.repository == 'github/codeql-action'
+    permissions:
+      contents: write # needed to push commits
+      pull-requests: write # needed to create pull request
 
     steps:
       - name: Setup Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.7"
+          python-version: "3.13"
       - name: Checkout CodeQL Action
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Checkout Enterprise Releases
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: github/enterprise-releases
-          ssh-key: ${{ secrets.ENTERPRISE_RELEASES_SSH_KEY }}
+          token: ${{ secrets.ENTERPRISE_RELEASE_TOKEN }}
           path: ${{ github.workspace }}/enterprise-releases/
       - name: Update Supported Enterprise Server Versions
         run: |
@@ -34,14 +38,31 @@ jobs:
           npm run build
         env:
           ENTERPRISE_RELEASES_PATH: ${{ github.workspace }}/enterprise-releases/
-      - name: Commit Changes
-        uses: peter-evans/create-pull-request@c7f493a8000b8aeb17a1332e326ba76b57cb83eb # v3.4.1
-        with:
-          commit-message: Update supported GitHub Enterprise Server versions.
-          title: Update supported GitHub Enterprise Server versions.
-          body: ""
-          author: GitHub <noreply@github.com>
-          branch: update-supported-enterprise-server-versions
-          draft: true
+
+      - name: Update git config
+        run: |
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Commit changes and open PR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ -z $(git status --porcelain) ]]; then
+            echo "No changes to commit"
+          else
+            git checkout -b update-supported-enterprise-server-versions
+            git add .
+            git commit --message "Update supported GitHub Enterprise Server versions"
+            git push origin update-supported-enterprise-server-versions
+
+            body="This PR updates the list of supported GitHub Enterprise Server versions, either because a new "
+            body+="version is about to be feature frozen, or because an old release has been deprecated."
+            body+=$'\n\n'
+            body+="If an old release has been deprecated, please follow the instructions in CONTRIBUTING.md to "
+            body+="deprecate the corresponding version of CodeQL."
+
+            gh pr create --draft \
+              --title "Update supported GitHub Enterprise Server versions" \
+              --body "$body"
+          fi

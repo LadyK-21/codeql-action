@@ -1,20 +1,46 @@
 version: 2
 updates:
-  - package-ecosystem: "npm"
+  - package-ecosystem: npm
     directory: "/"
+    reviewers:
+      - "github/codeql-production-shield"
     schedule:
-      interval: "weekly"
-      day: "thursday" # Gives us a working day to merge this before our typical release
+      interval: weekly
     labels:
-      - "Update dependencies"
+      - Update dependencies
+    # Ignore incompatible dependency updates
     ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-minor", "version-update:semver-patch"]
-  - package-ecosystem: "npm"
-    directory: "/runner"
+      # There is a type incompatibility issue between v0.0.9 and our other dependencies.
+      - dependency-name: "@octokit/plugin-retry"
+        versions: ["~6.0.0"]
+      # v7 requires ESM
+      - dependency-name: "del"
+        versions: ["^7.0.0"]
+      # This is broken due to the way configuration files have changed. 
+      # This might be fixed when we move to eslint v9.
+      - dependency-name: "eslint-plugin-import"
+        versions: [">=2.30.0"]
+    groups:
+      npm:
+        patterns:
+          - "*"
+  - package-ecosystem: github-actions
+    directory: "/"
+    reviewers:
+      - "github/codeql-production-shield"
     schedule:
-      interval: "weekly"
-      day: "thursday" # Gives us a working day to merge this before our typical release
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-minor", "version-update:semver-patch"]
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+  - package-ecosystem: github-actions
+    directory: "/.github/actions/setup-swift/" # All subdirectories outside of "/.github/workflows" must be explicitly included.
+    reviewers:
+      - "github/codeql-production-shield"
+    schedule:
+      interval: weekly
+    groups:
+      actions-setup-swift:
+        patterns:
+          - "*"
