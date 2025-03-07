@@ -9,10 +9,9 @@ const {
   removeAll: cleanAll,
 } = require('./intercept')
 const { loadDefs, define } = require('./scope')
-
+const { back: debug } = require('./debug')
 const { format } = require('util')
 const path = require('path')
-const debug = require('debug')('nock.back')
 
 let _mode = null
 
@@ -49,7 +48,7 @@ function Back(fixtureName, options, nockedFn) {
     throw new Error(
       'Back requires nock.back.fixtures to be set\n' +
         'Ex:\n' +
-        "\trequire(nock).back.fixtures = '/path/to/fixtures/'"
+        "\trequire(nock).back.fixtures = '/path/to/fixtures/'",
     )
   }
 
@@ -78,7 +77,6 @@ function Back(fixtureName, options, nockedFn) {
   }
 
   debug('context:', context)
-
   // If nockedFn is a function then invoke it, otherwise return a promise resolving to nockDone.
   if (typeof nockedFn === 'function') {
     nockedFn.call(context, nockDone)
@@ -175,6 +173,47 @@ const record = {
   },
 }
 
+const update = {
+  setup: function () {
+    recorder.restore()
+    recorder.clear()
+    cleanAll()
+    activate()
+    disableNetConnect()
+  },
+
+  start: function (fixture, options) {
+    if (!fs) {
+      throw new Error('no fs')
+    }
+    const context = removeFixture(fixture)
+    recorder.record({
+      dont_print: true,
+      output_objects: true,
+      ...options.recorder,
+    })
+
+    context.isRecording = true
+
+    return context
+  },
+
+  finish: function (fixture, options, context) {
+    let outputs = recorder.outputs()
+
+    if (typeof options.afterRecord === 'function') {
+      outputs = options.afterRecord(outputs)
+    }
+
+    outputs =
+      typeof outputs === 'string' ? outputs : JSON.stringify(outputs, null, 4)
+    debug('recorder outputs:', outputs)
+
+    fs.mkdirSync(path.dirname(fixture), { recursive: true })
+    fs.writeFileSync(fixture, outputs)
+  },
+}
+
 const lockdown = {
   setup: function () {
     recorder.restore()
@@ -199,6 +238,23 @@ function load(fixture, options) {
     assertScopesFinished: function () {
       assertScopes(this.scopes, fixture)
     },
+    query: function () {
+      const nested = this.scopes.map(scope =>
+        scope.interceptors.map(interceptor => ({
+          method: interceptor.method,
+          uri: interceptor.uri,
+          basePath: interceptor.basePath,
+          path: interceptor.path,
+          queries: interceptor.queries,
+          counter: interceptor.counter,
+          body: interceptor.body,
+          statusCode: interceptor.statusCode,
+          optional: interceptor.optional,
+        })),
+      )
+
+      return [].concat.apply([], nested)
+    },
   }
 
   if (fixture && fixtureExists(fixture)) {
@@ -212,6 +268,20 @@ function load(fixture, options) {
     context.isLoaded = true
   }
 
+  return context
+}
+
+function removeFixture(fixture, options) {
+  const context = {
+    scopes: [],
+    assertScopesFinished: function () {},
+  }
+
+  if (fixture && fixtureExists(fixture)) {
+    /* istanbul ignore next - fs.unlinkSync is for node 10 support */
+    fs.rmSync ? fs.rmSync(fixture) : fs.unlinkSync(fixture)
+  }
+  context.isLoaded = false
   return context
 }
 
@@ -245,8 +315,8 @@ function assertScopes(scopes, fixture) {
       format(
         '%j was not used, consider removing %s to rerecord fixture',
         [].concat(...pending),
-        fixture
-      )
+        fixture,
+      ),
     )
   }
 }
@@ -257,6 +327,8 @@ const Modes = {
   dryrun, // use recorded nocks, allow http calls, doesnt record anything, useful for writing new tests (default)
 
   record, // use recorded nocks, record new nocks
+
+  update, // allow http calls, record all nocks, don't use recorded nocks
 
   lockdown, // use recorded nocks, disables all http calls even when not nocked, doesnt record
 }

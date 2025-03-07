@@ -1,68 +1,100 @@
 import * as fs from "fs";
 import * as path from "path";
-import { performance } from "perf_hooks"; // We need to import `performance` on Node 12
+import { performance } from "perf_hooks";
 
-import * as toolrunner from "@actions/exec/lib/toolrunner";
+import * as io from "@actions/io";
 import del from "del";
 import * as yaml from "js-yaml";
 
-import { DatabaseCreationTimings } from "./actions-util";
-import * as analysisPaths from "./analysis-paths";
-import {
-  CodeQL,
-  CODEQL_VERSION_COUNTS_LINES,
-  CODEQL_VERSION_NEW_TRACING,
-  getCodeQL,
-} from "./codeql";
+import * as actionsUtil from "./actions-util";
+import { getApiClient } from "./api-client";
+import { setupCppAutobuild } from "./autobuild";
+import { CodeQL, getCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
-import { countLoc } from "./count-loc";
-import { FeatureFlags } from "./feature-flags";
+import { addDiagnostic, makeDiagnostic } from "./diagnostics";
+import {
+  DiffThunkRange,
+  writeDiffRangesJsonFile,
+} from "./diff-filtering-utils";
+import { EnvVar } from "./environment";
+import { FeatureEnablement, Feature } from "./feature-flags";
 import { isScannedLanguage, Language } from "./languages";
-import { Logger } from "./logging";
-import * as sharedEnv from "./shared-environment";
+import { Logger, withGroupAsync } from "./logging";
+import { DatabaseCreationTimings, EventReport } from "./status-report";
+import { ToolsFeature } from "./tools-features";
 import { endTracingForCluster } from "./tracer-config";
+import { validateSarifFileSchema } from "./upload-lib";
 import * as util from "./util";
+import { BuildMode } from "./util";
 
 export class CodeQLAnalysisError extends Error {
-  queriesStatusReport: QueriesStatusReport;
-
-  constructor(queriesStatusReport: QueriesStatusReport, message: string) {
+  constructor(
+    public queriesStatusReport: QueriesStatusReport,
+    public message: string,
+    public error: Error,
+  ) {
     super(message);
-
     this.name = "CodeQLAnalysisError";
-    this.queriesStatusReport = queriesStatusReport;
   }
 }
 
 export interface QueriesStatusReport {
-  /** Time taken in ms to run builtin queries for cpp (or undefined if this language was not analyzed). */
+  /**
+   * Time taken in ms to run queries for cpp (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
   analyze_builtin_queries_cpp_duration_ms?: number;
-  /** Time taken in ms to run builtin queries for csharp (or undefined if this language was not analyzed). */
+  /**
+   * Time taken in ms to run queries for csharp (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
   analyze_builtin_queries_csharp_duration_ms?: number;
-  /** Time taken in ms to run builtin queries for go (or undefined if this language was not analyzed). */
+  /**
+   * Time taken in ms to run queries for go (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
   analyze_builtin_queries_go_duration_ms?: number;
-  /** Time taken in ms to run builtin queries for java (or undefined if this language was not analyzed). */
+  /**
+   * Time taken in ms to run queries for java (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
   analyze_builtin_queries_java_duration_ms?: number;
-  /** Time taken in ms to run builtin queries for javascript (or undefined if this language was not analyzed). */
+  /**
+   * Time taken in ms to run queries for javascript (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
   analyze_builtin_queries_javascript_duration_ms?: number;
-  /** Time taken in ms to run builtin queries for python (or undefined if this language was not analyzed). */
+  /**
+   * Time taken in ms to run queries for python (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
   analyze_builtin_queries_python_duration_ms?: number;
-  /** Time taken in ms to run builtin queries for ruby (or undefined if this language was not analyzed). */
+  /**
+   * Time taken in ms to run queries for ruby (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
   analyze_builtin_queries_ruby_duration_ms?: number;
-  /** Time taken in ms to run custom queries for cpp (or undefined if this language was not analyzed). */
-  analyze_custom_queries_cpp_duration_ms?: number;
-  /** Time taken in ms to run custom queries for csharp (or undefined if this language was not analyzed). */
-  analyze_custom_queries_csharp_duration_ms?: number;
-  /** Time taken in ms to run custom queries for go (or undefined if this language was not analyzed). */
-  analyze_custom_queries_go_duration_ms?: number;
-  /** Time taken in ms to run custom queries for java (or undefined if this language was not analyzed). */
-  analyze_custom_queries_java_duration_ms?: number;
-  /** Time taken in ms to run custom queries for javascript (or undefined if this language was not analyzed). */
-  analyze_custom_queries_javascript_duration_ms?: number;
-  /** Time taken in ms to run custom queries for python (or undefined if this language was not analyzed). */
-  analyze_custom_queries_python_duration_ms?: number;
-  /** Time taken in ms to run custom queries for ruby (or undefined if this language was not analyzed). */
-  analyze_custom_queries_ruby_duration_ms?: number;
+  /** Time taken in ms to run queries for swift (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
+  analyze_builtin_queries_swift_duration_ms?: number;
+
   /** Time taken in ms to interpret results for cpp (or undefined if this language was not analyzed). */
   interpret_results_cpp_duration_ms?: number;
   /** Time taken in ms to interpret results for csharp (or undefined if this language was not analyzed). */
@@ -77,8 +109,19 @@ export interface QueriesStatusReport {
   interpret_results_python_duration_ms?: number;
   /** Time taken in ms to interpret results for ruby (or undefined if this language was not analyzed). */
   interpret_results_ruby_duration_ms?: number;
+  /** Time taken in ms to interpret results for swift (or undefined if this language was not analyzed). */
+  interpret_results_swift_duration_ms?: number;
+
+  /**
+   * Whether the analysis is diff-informed (in the sense that the action generates a diff-range data
+   * extension for the analysis, regardless of whether the data extension is actually used by queries).
+   */
+  analysis_is_diff_informed?: boolean;
+
   /** Name of language that errored during analysis (or undefined if no language failed). */
   analyze_failure_language?: string;
+  /** Reports on discrete events associated with this status report. */
+  event_reports?: EventReport[];
 }
 
 async function setupPythonExtractor(logger: Logger) {
@@ -88,111 +131,105 @@ async function setupPythonExtractor(logger: Logger) {
     return;
   }
 
-  let output = "";
-  const options = {
-    listeners: {
-      stdout: (data: Buffer) => {
-        output += data.toString();
-      },
-    },
-  };
-
-  await new toolrunner.ToolRunner(
-    codeqlPython,
-    [
-      "-c",
-      "import os; import pip; print(os.path.dirname(os.path.dirname(pip.__file__)))",
-    ],
-    options
-  ).exec();
-  logger.info(`Setting LGTM_INDEX_IMPORT_PATH=${output}`);
-  process.env["LGTM_INDEX_IMPORT_PATH"] = output;
-
-  output = "";
-  await new toolrunner.ToolRunner(
-    codeqlPython,
-    ["-c", "import sys; print(sys.version_info[0])"],
-    options
-  ).exec();
-  logger.info(`Setting LGTM_PYTHON_SETUP_VERSION=${output}`);
-  process.env["LGTM_PYTHON_SETUP_VERSION"] = output;
+  logger.warning(
+    "The CODEQL_PYTHON environment variable is no longer supported. Please remove it from your workflow. This environment variable was originally used to specify a Python executable that included the dependencies of your Python code, however Python analysis no longer uses these dependencies." +
+      "\nIf you used CODEQL_PYTHON to force the version of Python to analyze as, please use CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION instead, such as 'CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION=2.7' or 'CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION=3.11'.",
+  );
+  return;
 }
 
-export async function createdDBForScannedLanguages(
+export async function runExtraction(
   codeql: CodeQL,
   config: configUtils.Config,
   logger: Logger,
-  featureFlags: FeatureFlags
 ) {
-  // Insert the LGTM_INDEX_X env vars at this point so they are set when
-  // we extract any scanned languages.
-  analysisPaths.includeAndExcludeAnalysisPaths(config);
-
   for (const language of config.languages) {
-    if (
-      isScannedLanguage(
-        language,
-        await util.isGoExtractionReconciliationEnabled(featureFlags),
-        logger
-      ) &&
-      !dbIsFinalized(config, language, logger)
-    ) {
-      logger.startGroup(`Extracting ${language}`);
+    if (dbIsFinalized(config, language, logger)) {
+      logger.debug(
+        `Database for ${language} has already been finalized, skipping extraction.`,
+      );
+      continue;
+    }
 
+    if (shouldExtractLanguage(config, language)) {
+      logger.startGroup(`Extracting ${language}`);
       if (language === Language.python) {
         await setupPythonExtractor(logger);
       }
-
-      await codeql.extractScannedLanguage(config, language);
+      if (
+        config.buildMode &&
+        (await codeql.supportsFeature(ToolsFeature.TraceCommandUseBuildMode))
+      ) {
+        if (
+          language === Language.cpp &&
+          config.buildMode === BuildMode.Autobuild
+        ) {
+          await setupCppAutobuild(codeql, logger);
+        }
+        await codeql.extractUsingBuildMode(config, language);
+      } else {
+        await codeql.extractScannedLanguage(config, language);
+      }
       logger.endGroup();
     }
   }
 }
 
+function shouldExtractLanguage(
+  config: configUtils.Config,
+  language: Language,
+): boolean {
+  return (
+    config.buildMode === BuildMode.None ||
+    (config.buildMode === BuildMode.Autobuild &&
+      process.env[EnvVar.AUTOBUILD_DID_COMPLETE_SUCCESSFULLY] !== "true") ||
+    (!config.buildMode && isScannedLanguage(language))
+  );
+}
+
 export function dbIsFinalized(
   config: configUtils.Config,
   language: Language,
-  logger: Logger
+  logger: Logger,
 ) {
   const dbPath = util.getCodeQLDatabasePath(config, language);
   try {
     const dbInfo = yaml.load(
-      fs.readFileSync(path.resolve(dbPath, "codeql-database.yml"), "utf8")
+      fs.readFileSync(path.resolve(dbPath, "codeql-database.yml"), "utf8"),
     ) as { inProgress?: boolean };
     return !("inProgress" in dbInfo);
-  } catch (e) {
+  } catch {
     logger.warning(
-      `Could not check whether database for ${language} was finalized. Assuming it is not.`
+      `Could not check whether database for ${language} was finalized. Assuming it is not.`,
     );
     return false;
   }
 }
 
 async function finalizeDatabaseCreation(
+  codeql: CodeQL,
   config: configUtils.Config,
   threadsFlag: string,
   memoryFlag: string,
   logger: Logger,
-  featureFlags: FeatureFlags
 ): Promise<DatabaseCreationTimings> {
-  const codeql = await getCodeQL(config.codeQLCmd);
-
   const extractionStart = performance.now();
-  await createdDBForScannedLanguages(codeql, config, logger, featureFlags);
+  await runExtraction(codeql, config, logger);
   const extractionTime = performance.now() - extractionStart;
 
   const trapImportStart = performance.now();
   for (const language of config.languages) {
     if (dbIsFinalized(config, language, logger)) {
       logger.info(
-        `There is already a finalized database for ${language} at the location where the CodeQL Action places databases, so we did not create one.`
+        `There is already a finalized database for ${language} at the location where the CodeQL Action places databases, so we did not create one.`,
       );
     } else {
       logger.startGroup(`Finalizing ${language}`);
       await codeql.finalizeDatabase(
         util.getCodeQLDatabasePath(config, language),
         threadsFlag,
-        memoryFlag
+        memoryFlag,
+        config.debugMode,
       );
       logger.endGroup();
     }
@@ -205,166 +242,391 @@ async function finalizeDatabaseCreation(
   };
 }
 
+/**
+ * Set up the diff-informed analysis feature.
+ *
+ * @param baseRef The base branch name, used for calculating the diff range.
+ * @param headLabel The label that uniquely identifies the head branch across
+ * repositories, used for calculating the diff range.
+ * @param codeql
+ * @param logger
+ * @param features
+ * @returns Absolute path to the directory containing the extension pack for
+ * the diff range information, or `undefined` if the feature is disabled.
+ */
+export async function setupDiffInformedQueryRun(
+  baseRef: string,
+  headLabel: string,
+  codeql: CodeQL,
+  logger: Logger,
+  features: FeatureEnablement,
+): Promise<string | undefined> {
+  if (!(await features.getValue(Feature.DiffInformedQueries, codeql))) {
+    return undefined;
+  }
+  return await withGroupAsync(
+    "Generating diff range extension pack",
+    async () => {
+      const diffRanges = await getPullRequestEditedDiffRanges(
+        baseRef,
+        headLabel,
+        logger,
+      );
+      const packDir = writeDiffRangeDataExtensionPack(logger, diffRanges);
+      if (packDir === undefined) {
+        logger.warning(
+          "Cannot create diff range extension pack for diff-informed queries; " +
+            "reverting to performing full analysis.",
+        );
+      } else {
+        logger.info(
+          `Successfully created diff range extension pack at ${packDir}.`,
+        );
+      }
+      return packDir;
+    },
+  );
+}
+
+/**
+ * Return the file line ranges that were added or modified in the pull request.
+ *
+ * @param baseRef The base branch name, used for calculating the diff range.
+ * @param headLabel The label that uniquely identifies the head branch across
+ * repositories, used for calculating the diff range.
+ * @param logger
+ * @returns An array of tuples, where each tuple contains the absolute path of a
+ * file, the start line and the end line (both 1-based and inclusive) of an
+ * added or modified range in that file. Returns `undefined` if the action was
+ * not triggered by a pull request or if there was an error.
+ */
+async function getPullRequestEditedDiffRanges(
+  baseRef: string,
+  headLabel: string,
+  logger: Logger,
+): Promise<DiffThunkRange[] | undefined> {
+  const fileDiffs = await getFileDiffsWithBasehead(baseRef, headLabel, logger);
+  if (fileDiffs === undefined) {
+    return undefined;
+  }
+  if (fileDiffs.length >= 300) {
+    // The "compare two commits" API returns a maximum of 300 changed files. If
+    // we see that many changed files, it is possible that there could be more,
+    // with the rest being truncated. In this case, we should not attempt to
+    // compute the diff ranges, as the result would be incomplete.
+    logger.warning(
+      `Cannot retrieve the full diff because there are too many ` +
+        `(${fileDiffs.length}) changed files in the pull request.`,
+    );
+    return undefined;
+  }
+  const results: DiffThunkRange[] = [];
+  for (const filediff of fileDiffs) {
+    const diffRanges = getDiffRanges(filediff, logger);
+    if (diffRanges === undefined) {
+      return undefined;
+    }
+    results.push(...diffRanges);
+  }
+  return results;
+}
+
+/**
+ * This interface is an abbreviated version of the file diff object returned by
+ * the GitHub API.
+ */
+interface FileDiff {
+  filename: string;
+  changes: number;
+  // A patch may be absent if the file is binary, if the file diff is too large,
+  // or if the file is unchanged.
+  patch?: string | undefined;
+}
+
+async function getFileDiffsWithBasehead(
+  baseRef: string,
+  headLabel: string,
+  logger: Logger,
+): Promise<FileDiff[] | undefined> {
+  const ownerRepo = util.getRequiredEnvParam("GITHUB_REPOSITORY").split("/");
+  const owner = ownerRepo[0];
+  const repo = ownerRepo[1];
+  const basehead = `${baseRef}...${headLabel}`;
+  try {
+    const response = await getApiClient().rest.repos.compareCommitsWithBasehead(
+      {
+        owner,
+        repo,
+        basehead,
+        per_page: 1,
+      },
+    );
+    logger.debug(
+      `Response from compareCommitsWithBasehead(${basehead}):` +
+        `\n${JSON.stringify(response, null, 2)}`,
+    );
+    return response.data.files;
+  } catch (error: any) {
+    if (error.status) {
+      logger.warning(`Error retrieving diff ${basehead}: ${error.message}`);
+      logger.debug(
+        `Error running compareCommitsWithBasehead(${basehead}):` +
+          `\nRequest: ${JSON.stringify(error.request, null, 2)}` +
+          `\nError Response: ${JSON.stringify(error.response, null, 2)}`,
+      );
+      return undefined;
+    } else {
+      throw error;
+    }
+  }
+}
+
+function getDiffRanges(
+  fileDiff: FileDiff,
+  logger: Logger,
+): DiffThunkRange[] | undefined {
+  // Diff-informed queries expect the file path to be absolute. CodeQL always
+  // uses forward slashes as the path separator, so on Windows we need to
+  // replace any backslashes with forward slashes.
+  const filename = path
+    .join(actionsUtil.getRequiredInput("checkout_path"), fileDiff.filename)
+    .replaceAll(path.sep, "/");
+
+  if (fileDiff.patch === undefined) {
+    if (fileDiff.changes === 0) {
+      // There are situations where a changed file legitimately has no diff.
+      // For example, the file may be a binary file, or that the file may have
+      // been renamed with no changes to its contents. In these cases, the
+      // file would be reported as having 0 changes, and we can return an empty
+      // array to indicate no diff range in this file.
+      return [];
+    }
+    // If a file is reported to have nonzero changes but no patch, that may be
+    // due to the file diff being too large. In this case, we should fall back
+    // to a special diff range that covers the entire file.
+    return [
+      {
+        path: filename,
+        startLine: 0,
+        endLine: 0,
+      },
+    ];
+  }
+
+  // The 1-based file line number of the current line
+  let currentLine = 0;
+  // The 1-based file line number that starts the current range of added lines
+  let additionRangeStartLine: number | undefined = undefined;
+  const diffRanges: DiffThunkRange[] = [];
+
+  const diffLines = fileDiff.patch.split("\n");
+  // Adding a fake context line at the end ensures that the following loop will
+  // always terminate the last range of added lines.
+  diffLines.push(" ");
+
+  for (const diffLine of diffLines) {
+    if (diffLine.startsWith("-")) {
+      // Ignore deletions completely -- we do not even want to consider them when
+      // calculating consecutive ranges of added lines.
+      continue;
+    }
+    if (diffLine.startsWith("+")) {
+      if (additionRangeStartLine === undefined) {
+        additionRangeStartLine = currentLine;
+      }
+      currentLine++;
+      continue;
+    }
+    if (additionRangeStartLine !== undefined) {
+      // Any line that does not start with a "+" or "-" terminates the current
+      // range of added lines.
+      diffRanges.push({
+        path: filename,
+        startLine: additionRangeStartLine,
+        endLine: currentLine - 1,
+      });
+      additionRangeStartLine = undefined;
+    }
+    if (diffLine.startsWith("@@ ")) {
+      // A new hunk header line resets the current line number.
+      const match = diffLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (match === null) {
+        logger.warning(
+          `Cannot parse diff hunk header for ${fileDiff.filename}: ${diffLine}`,
+        );
+        return undefined;
+      }
+      currentLine = parseInt(match[1], 10);
+      continue;
+    }
+    if (diffLine.startsWith(" ")) {
+      // An unchanged context line advances the current line number.
+      currentLine++;
+      continue;
+    }
+  }
+  return diffRanges;
+}
+
+/**
+ * Create an extension pack in the temporary directory that contains the file
+ * line ranges that were added or modified in the pull request.
+ *
+ * @param logger
+ * @param ranges The file line ranges, as returned by
+ * `getPullRequestEditedDiffRanges`.
+ * @returns The absolute path of the directory containing the extension pack, or
+ * `undefined` if no extension pack was created.
+ */
+function writeDiffRangeDataExtensionPack(
+  logger: Logger,
+  ranges: DiffThunkRange[] | undefined,
+): string | undefined {
+  if (ranges === undefined) {
+    return undefined;
+  }
+
+  const diffRangeDir = path.join(
+    actionsUtil.getTemporaryDirectory(),
+    "pr-diff-range",
+  );
+  fs.mkdirSync(diffRangeDir);
+  fs.writeFileSync(
+    path.join(diffRangeDir, "qlpack.yml"),
+    `
+name: codeql-action/pr-diff-range
+version: 0.0.0
+library: true
+extensionTargets:
+  codeql/util: '*'
+dataExtensions:
+  - pr-diff-range.yml
+`,
+  );
+
+  const header = `
+extensions:
+  - addsTo:
+      pack: codeql/util
+      extensible: restrictAlertsTo
+    data:
+`;
+
+  let data = ranges
+    .map(
+      (range) =>
+        // Using yaml.dump() with `forceQuotes: true` ensures that all special
+        // characters are escaped, and that the path is always rendered as a
+        // quoted string on a single line.
+        `      - [${yaml.dump(range.path, { forceQuotes: true }).trim()}, ` +
+        `${range.startLine}, ${range.endLine}]\n`,
+    )
+    .join("");
+  if (!data) {
+    // Ensure that the data extension is not empty, so that a pull request with
+    // no edited lines would exclude (instead of accepting) all alerts.
+    data = '      - ["", 0, 0]\n';
+  }
+
+  const extensionContents = header + data;
+  const extensionFilePath = path.join(diffRangeDir, "pr-diff-range.yml");
+  fs.writeFileSync(extensionFilePath, extensionContents);
+  logger.debug(
+    `Wrote pr-diff-range extension pack to ${extensionFilePath}:\n${extensionContents}`,
+  );
+
+  // Write the diff ranges to a JSON file, for action-side alert filtering by the
+  // upload-lib module.
+  writeDiffRangesJsonFile(logger, ranges);
+
+  return diffRangeDir;
+}
+
 // Runs queries and creates sarif files in the given folder
 export async function runQueries(
   sarifFolder: string,
   memoryFlag: string,
   addSnippetsFlag: string,
   threadsFlag: string,
+  diffRangePackDir: string | undefined,
   automationDetailsId: string | undefined,
   config: configUtils.Config,
-  logger: Logger
+  logger: Logger,
+  features: FeatureEnablement,
 ): Promise<QueriesStatusReport> {
   const statusReport: QueriesStatusReport = {};
 
-  let locPromise: Promise<Partial<Record<Language, number>>> = Promise.resolve(
-    {}
-  );
-  const cliCanCountBaseline = await cliCanCountLoC();
-  const countLocDebugMode =
-    process.env["INTERNAL_CODEQL_ACTION_DEBUG_LOC"] || config.debugMode;
-  if (!cliCanCountBaseline || countLocDebugMode) {
-    // count the number of lines in the background
-    locPromise = countLoc(
-      path.resolve(),
-      // config.paths specifies external directories. the current
-      // directory is included in the analysis by default. Replicate
-      // that here.
-      config.paths,
-      config.pathsIgnore,
-      config.languages,
-      logger
-    );
-  }
+  statusReport.analysis_is_diff_informed = diffRangePackDir !== undefined;
+  const dataExtensionFlags = diffRangePackDir
+    ? [
+        `--additional-packs=${diffRangePackDir}`,
+        "--extension-packs=codeql-action/pr-diff-range",
+      ]
+    : [];
+  const sarifRunPropertyFlag = diffRangePackDir
+    ? "--sarif-run-property=incrementalMode=diff-informed"
+    : undefined;
 
   const codeql = await getCodeQL(config.codeQLCmd);
+  const queryFlags = [memoryFlag, threadsFlag, ...dataExtensionFlags];
+
   for (const language of config.languages) {
-    const queries = config.queries[language];
-    const queryFilters = validateQueryFilters(
-      config.originalUserInput["query-filters"]
-    );
-    const packsWithVersion = config.packs[language] || [];
-
-    const hasBuiltinQueries = queries?.builtin.length > 0;
-    const hasCustomQueries = queries?.custom.length > 0;
-    const hasPackWithCustomQueries = packsWithVersion.length > 0;
-
-    if (!hasBuiltinQueries && !hasCustomQueries && !hasPackWithCustomQueries) {
-      throw new Error(
-        `Unable to analyse ${language} as no queries were selected for this language`
-      );
-    }
-
     try {
-      if (await util.useCodeScanningConfigInCli(codeql)) {
-        // If we are using the codescanning config in the CLI,
-        // much of the work needed to generate the query suites
-        // is done in the CLI. We just need to make a single
-        // call to run all the queries for each language and
-        // another to interpret the results.
-        logger.startGroup(`Running queries for ${language}`);
-        const startTimeBuiltIn = new Date().getTime();
-        await runQueryGroup(language, "all", undefined, undefined);
-        // TODO should not be using `builtin` here. We should be using `all` instead.
-        // The status report does not support `all` yet.
-        statusReport[`analyze_builtin_queries_${language}_duration_ms`] =
-          new Date().getTime() - startTimeBuiltIn;
+      const sarifFile = path.join(sarifFolder, `${language}.sarif`);
 
-        logger.startGroup(`Interpreting results for ${language}`);
-        const startTimeInterpretResults = new Date().getTime();
-        const sarifFile = path.join(sarifFolder, `${language}.sarif`);
-        const analysisSummary = await runInterpretResults(
+      // The work needed to generate the query suites
+      // is done in the CLI. We just need to make a single
+      // call to run all the queries for each language and
+      // another to interpret the results.
+      logger.startGroup(`Running queries for ${language}`);
+      const startTimeRunQueries = new Date().getTime();
+      const databasePath = util.getCodeQLDatabasePath(config, language);
+      await codeql.databaseRunQueries(databasePath, queryFlags);
+      logger.debug(`Finished running queries for ${language}.`);
+      // TODO should not be using `builtin` here. We should be using `all` instead.
+      // The status report does not support `all` yet.
+      statusReport[`analyze_builtin_queries_${language}_duration_ms`] =
+        new Date().getTime() - startTimeRunQueries;
+
+      logger.startGroup(`Interpreting results for ${language}`);
+      const startTimeInterpretResults = new Date();
+      const analysisSummary = await runInterpretResults(
+        language,
+        undefined,
+        sarifFile,
+        config.debugMode,
+      );
+      const endTimeInterpretResults = new Date();
+      statusReport[`interpret_results_${language}_duration_ms`] =
+        endTimeInterpretResults.getTime() - startTimeInterpretResults.getTime();
+      logger.endGroup();
+      logger.info(analysisSummary);
+
+      if (await features.getValue(Feature.QaTelemetryEnabled)) {
+        const perQueryAlertCounts = getPerQueryAlertCounts(sarifFile, logger);
+
+        const perQueryAlertCountEventReport: EventReport = {
+          event: "codeql database interpret-results",
+          started_at: startTimeInterpretResults.toISOString(),
+          completed_at: endTimeInterpretResults.toISOString(),
+          exit_status: "success",
           language,
-          undefined,
-          sarifFile,
-          config.debugMode
-        );
-        statusReport[`interpret_results_${language}_duration_ms`] =
-          new Date().getTime() - startTimeInterpretResults;
-        logger.endGroup();
-        logger.info(analysisSummary);
-      } else {
-        logger.startGroup(`Running queries for ${language}`);
-        const querySuitePaths: string[] = [];
-        if (queries["builtin"].length > 0) {
-          const startTimeBuiltIn = new Date().getTime();
-          querySuitePaths.push(
-            (await runQueryGroup(
-              language,
-              "builtin",
-              createQuerySuiteContents(queries["builtin"], queryFilters),
-              undefined
-            )) as string
-          );
-          statusReport[`analyze_builtin_queries_${language}_duration_ms`] =
-            new Date().getTime() - startTimeBuiltIn;
+          properties: {
+            alertCounts: perQueryAlertCounts,
+          },
+        };
+
+        if (statusReport["event_reports"] === undefined) {
+          statusReport["event_reports"] = [];
         }
-        const startTimeCustom = new Date().getTime();
-        let ranCustom = false;
-        for (let i = 0; i < queries["custom"].length; ++i) {
-          if (queries["custom"][i].queries.length > 0) {
-            querySuitePaths.push(
-              (await runQueryGroup(
-                language,
-                `custom-${i}`,
-                createQuerySuiteContents(
-                  queries["custom"][i].queries,
-                  queryFilters
-                ),
-                queries["custom"][i].searchPath
-              )) as string
-            );
-            ranCustom = true;
-          }
-        }
-        if (packsWithVersion.length > 0) {
-          querySuitePaths.push(
-            await runQueryPacks(
-              language,
-              "packs",
-              packsWithVersion,
-              queryFilters
-            )
-          );
-          ranCustom = true;
-        }
-        if (ranCustom) {
-          statusReport[`analyze_custom_queries_${language}_duration_ms`] =
-            new Date().getTime() - startTimeCustom;
-        }
-        logger.endGroup();
-        logger.startGroup(`Interpreting results for ${language}`);
-        const startTimeInterpretResults = new Date().getTime();
-        const sarifFile = path.join(sarifFolder, `${language}.sarif`);
-        const analysisSummary = await runInterpretResults(
-          language,
-          querySuitePaths,
-          sarifFile,
-          config.debugMode
-        );
-        if (!cliCanCountBaseline) {
-          await injectLinesOfCode(sarifFile, language, locPromise);
-        }
-        statusReport[`interpret_results_${language}_duration_ms`] =
-          new Date().getTime() - startTimeInterpretResults;
-        logger.endGroup();
-        logger.info(analysisSummary);
-      }
-      if (!cliCanCountBaseline || countLocDebugMode) {
-        printLinesOfCodeSummary(logger, language, await locPromise);
-      }
-      if (cliCanCountBaseline) {
-        logger.info(await runPrintLinesOfCode(language));
+        statusReport["event_reports"].push(perQueryAlertCountEventReport);
       }
     } catch (e) {
-      logger.info(String(e));
-      if (e instanceof Error) {
-        logger.info(e.stack!);
-      }
       statusReport.analyze_failure_language = language;
       throw new CodeQLAnalysisError(
         statusReport,
-        `Error running analysis for ${language}: ${e}`
+        `Error running analysis for ${language}: ${util.getErrorMessage(e)}`,
+        util.wrapError(e),
       );
     }
   }
@@ -375,7 +637,7 @@ export async function runQueries(
     language: Language,
     queries: string[] | undefined,
     sarifFile: string,
-    enableDebugLogging: boolean
+    enableDebugLogging: boolean,
   ): Promise<string> {
     const databasePath = util.getCodeQLDatabasePath(config, language);
     return await codeql.databaseInterpretResults(
@@ -385,118 +647,49 @@ export async function runQueries(
       addSnippetsFlag,
       threadsFlag,
       enableDebugLogging ? "-vv" : "-v",
-      automationDetailsId
+      sarifRunPropertyFlag,
+      automationDetailsId,
+      config,
+      features,
     );
   }
 
-  async function cliCanCountLoC() {
-    return await util.codeQlVersionAbove(
-      await getCodeQL(config.codeQLCmd),
-      CODEQL_VERSION_COUNTS_LINES
-    );
-  }
+  /** Get an object with all queries and their counts parsed from a SARIF file path. */
+  function getPerQueryAlertCounts(
+    sarifPath: string,
+    log: Logger,
+  ): Record<string, number> {
+    validateSarifFileSchema(sarifPath, log);
+    const sarifObject = JSON.parse(
+      fs.readFileSync(sarifPath, "utf8"),
+    ) as util.SarifFile;
+    // We do not need to compute fingerprints because we are not sending data based off of locations.
 
-  async function runPrintLinesOfCode(language: Language): Promise<string> {
-    const databasePath = util.getCodeQLDatabasePath(config, language);
-    return await codeql.databasePrintBaseline(databasePath);
-  }
+    // Generate the query: alert count object
+    const perQueryAlertCounts: Record<string, number> = {};
 
-  async function runQueryGroup(
-    language: Language,
-    type: string,
-    querySuiteContents: string | undefined,
-    searchPath: string | undefined
-  ): Promise<string | undefined> {
-    const databasePath = util.getCodeQLDatabasePath(config, language);
-    // Pass the queries to codeql using a file instead of using the command
-    // line to avoid command line length restrictions, particularly on windows.
-    const querySuitePath = querySuiteContents
-      ? `${databasePath}-queries-${type}.qls`
-      : undefined;
-    if (querySuiteContents && querySuitePath) {
-      fs.writeFileSync(querySuitePath, querySuiteContents);
-      logger.debug(
-        `Query suite file for ${language}-${type}...\n${querySuiteContents}`
-      );
+    // All rules (queries), from all results, from all runs
+    for (const sarifRun of sarifObject.runs) {
+      if (sarifRun.results) {
+        for (const result of sarifRun.results) {
+          const query = result.rule?.id || result.ruleId;
+          if (query) {
+            perQueryAlertCounts[query] = (perQueryAlertCounts[query] || 0) + 1;
+          }
+        }
+      }
     }
-    await codeql.databaseRunQueries(
-      databasePath,
-      searchPath,
-      querySuitePath,
-      memoryFlag,
-      threadsFlag
-    );
-
-    logger.debug(`BQRS results produced for ${language} (queries: ${type})"`);
-    return querySuitePath;
+    return perQueryAlertCounts;
   }
-  async function runQueryPacks(
-    language: Language,
-    type: string,
-    packs: string[],
-    queryFilters: configUtils.QueryFilter[]
-  ): Promise<string> {
-    const databasePath = util.getCodeQLDatabasePath(config, language);
-
-    for (const pack of packs) {
-      logger.debug(`Running query pack for ${language}-${type}: ${pack}`);
-    }
-
-    // combine the list of packs into a query suite in order to run them all simultaneously.
-    const querySuite = (
-      packs.map(convertPackToQuerySuiteEntry) as configUtils.QuerySuiteEntry[]
-    ).concat(queryFilters);
-
-    const querySuitePath = `${databasePath}-queries-${type}.qls`;
-    fs.writeFileSync(querySuitePath, yaml.dump(querySuite));
-
-    logger.debug(`BQRS results produced for ${language} (queries: ${type})"`);
-
-    await codeql.databaseRunQueries(
-      databasePath,
-      undefined,
-      querySuitePath,
-      memoryFlag,
-      threadsFlag
-    );
-
-    return querySuitePath;
-  }
-}
-
-export function convertPackToQuerySuiteEntry(
-  packStr: string
-): configUtils.QuerySuitePackEntry {
-  const pack = configUtils.parsePacksSpecification(packStr);
-  return {
-    qlpack: !pack.path ? pack.name : undefined,
-    from: pack.path ? pack.name : undefined,
-    version: pack.version,
-    query: pack.path?.endsWith(".ql") ? pack.path : undefined,
-    queries:
-      !pack.path?.endsWith(".ql") && !pack.path?.endsWith(".qls")
-        ? pack.path
-        : undefined,
-    apply: pack.path?.endsWith(".qls") ? pack.path : undefined,
-  };
-}
-
-export function createQuerySuiteContents(
-  queries: string[],
-  queryFilters: configUtils.QueryFilter[]
-) {
-  return yaml.dump(
-    queries.map((q: string) => ({ query: q })).concat(queryFilters as any)
-  );
 }
 
 export async function runFinalize(
   outputDir: string,
   threadsFlag: string,
   memoryFlag: string,
+  codeql: CodeQL,
   config: configUtils.Config,
   logger: Logger,
-  featureFlags: FeatureFlags
 ): Promise<DatabaseCreationTimings> {
   try {
     await del(outputDir, { force: true });
@@ -508,37 +701,69 @@ export async function runFinalize(
   await fs.promises.mkdir(outputDir, { recursive: true });
 
   const timings = await finalizeDatabaseCreation(
+    codeql,
     config,
     threadsFlag,
     memoryFlag,
     logger,
-    featureFlags
   );
 
-  const codeql = await getCodeQL(config.codeQLCmd);
-  // WARNING: This does not _really_ end tracing, as the tracer will restore its
-  // critical environment variables and it'll still be active for all processes
-  // launched from this build step.
-  // However, it will stop tracing for all steps past the codeql-action/analyze
-  // step.
-  if (await util.codeQlVersionAbove(codeql, CODEQL_VERSION_NEW_TRACING)) {
-    // Delete variables as specified by the end-tracing script
-    await endTracingForCluster(
-      config,
-      await util.isGoExtractionReconciliationEnabled(featureFlags),
-      logger
-    );
-  } else {
-    // Delete the tracer config env var to avoid tracing ourselves
-    delete process.env[sharedEnv.ODASA_TRACER_CONFIGURATION];
+  // If we didn't already end tracing in the autobuild Action, end it now.
+  if (process.env[EnvVar.AUTOBUILD_DID_COMPLETE_SUCCESSFULLY] !== "true") {
+    await endTracingForCluster(codeql, config, logger);
   }
   return timings;
+}
+
+export async function warnIfGoInstalledAfterInit(
+  config: configUtils.Config,
+  logger: Logger,
+) {
+  // Check that `which go` still points at the same path it did when the `init` Action ran to ensure that no steps
+  // in-between performed any setup. We encourage users to perform all setup tasks before initializing CodeQL so that
+  // the setup tasks do not interfere with our analysis.
+  // Furthermore, if we installed a wrapper script in the `init` Action, we need to ensure that there isn't a step
+  // in the workflow after the `init` step which installs a different version of Go and takes precedence in the PATH,
+  // thus potentially circumventing our workaround that allows tracing to work.
+  const goInitPath = process.env[EnvVar.GO_BINARY_LOCATION];
+
+  if (
+    process.env[EnvVar.DID_AUTOBUILD_GOLANG] !== "true" &&
+    goInitPath !== undefined
+  ) {
+    const goBinaryPath = await io.which("go", true);
+
+    if (goInitPath !== goBinaryPath) {
+      logger.warning(
+        `Expected \`which go\` to return ${goInitPath}, but got ${goBinaryPath}: please ensure that the correct version of Go is installed before the \`codeql-action/init\` Action is used.`,
+      );
+
+      addDiagnostic(
+        config,
+        Language.go,
+        makeDiagnostic(
+          "go/workflow/go-installed-after-codeql-init",
+          "Go was installed after the `codeql-action/init` Action was run",
+          {
+            markdownMessage:
+              "To avoid interfering with the CodeQL analysis, perform all installation steps before calling the `github/codeql-action/init` Action.",
+            visibility: {
+              statusPage: true,
+              telemetry: true,
+              cliSummaryTable: true,
+            },
+            severity: "warning",
+          },
+        ),
+      );
+    }
+  }
 }
 
 export async function runCleanup(
   config: configUtils.Config,
   cleanupLevel: string,
-  logger: Logger
+  logger: Logger,
 ): Promise<void> {
   logger.startGroup("Cleaning up databases");
   for (const language of config.languages) {
@@ -549,82 +774,6 @@ export async function runCleanup(
   logger.endGroup();
 }
 
-async function injectLinesOfCode(
-  sarifFile: string,
-  language: Language,
-  locPromise: Promise<Partial<Record<Language, number>>>
-) {
-  const lineCounts = await locPromise;
-  if (language in lineCounts) {
-    const sarif = JSON.parse(fs.readFileSync(sarifFile, "utf8"));
-
-    if (Array.isArray(sarif.runs)) {
-      for (const run of sarif.runs) {
-        run.properties = run.properties || {};
-        run.properties.metricResults = run.properties.metricResults || [];
-        for (const metric of run.properties.metricResults) {
-          // Baseline is inserted when matching rule has tag lines-of-code
-          if (metric.rule && metric.rule.toolComponent) {
-            const matchingRule =
-              run.tool.extensions[metric.rule.toolComponent.index].rules[
-                metric.rule.index
-              ];
-            if (matchingRule.properties.tags?.includes("lines-of-code")) {
-              metric.baseline = lineCounts[language];
-            }
-          }
-        }
-      }
-    }
-
-    fs.writeFileSync(sarifFile, JSON.stringify(sarif));
-  }
-}
-
-function printLinesOfCodeSummary(
-  logger: Logger,
-  language: Language,
-  lineCounts: Partial<Record<Language, number>>
-) {
-  if (language in lineCounts) {
-    logger.info(
-      `Counted a baseline of ${lineCounts[language]} lines of code for ${language}.`
-    );
-  }
-}
-
-// exported for testing
-export function validateQueryFilters(queryFilters?: configUtils.QueryFilter[]) {
-  if (!queryFilters) {
-    return [];
-  }
-
-  if (!Array.isArray(queryFilters)) {
-    throw new Error(
-      `Query filters must be an array of "include" or "exclude" entries. Found ${typeof queryFilters}`
-    );
-  }
-
-  const errors: string[] = [];
-  for (const qf of queryFilters) {
-    const keys = Object.keys(qf);
-    if (keys.length !== 1) {
-      errors.push(
-        `Query filter must have exactly one key: ${JSON.stringify(qf)}`
-      );
-    }
-    if (!["exclude", "include"].includes(keys[0])) {
-      errors.push(
-        `Only "include" or "exclude" filters are allowed:\n${JSON.stringify(
-          qf
-        )}`
-      );
-    }
-  }
-
-  if (errors.length) {
-    throw new Error(`Invalid query filter.\n${errors.join("\n")}`);
-  }
-
-  return queryFilters;
-}
+export const exportedForTesting = {
+  getDiffRanges,
+};
