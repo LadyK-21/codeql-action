@@ -1,186 +1,584 @@
-import test from "ava";
+import * as fs from "fs";
+import * as path from "path";
 
-import { GitHubApiDetails } from "./api-client";
-import { FeatureFlag, GitHubFeatureFlags } from "./feature-flags";
+import test, { ExecutionContext } from "ava";
+
+import * as defaults from "./defaults.json";
+import {
+  Feature,
+  featureConfig,
+  FeatureEnablement,
+  Features,
+  FEATURE_FLAGS_FILE_NAME,
+} from "./feature-flags";
 import { getRunnerLogger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
 import {
   getRecordingLogger,
   LoggedMessage,
+  mockCodeQLVersion,
   mockFeatureFlagApiEndpoint,
   setupActionsVars,
   setupTests,
 } from "./testing-utils";
+import { ToolsFeature } from "./tools-features";
 import * as util from "./util";
-import { GitHubVariant, initializeEnvironment, Mode, withTmpDir } from "./util";
+import { GitHubVariant, initializeEnvironment, withTmpDir } from "./util";
 
 setupTests(test);
 
 test.beforeEach(() => {
-  initializeEnvironment(Mode.actions, "1.2.3");
+  initializeEnvironment("1.2.3");
 });
-
-const testApiDetails: GitHubApiDetails = {
-  auth: "1234",
-  url: "https://github.com",
-  apiURL: undefined,
-};
 
 const testRepositoryNwo = parseRepositoryNwo("github/example");
 
-const ALL_FEATURE_FLAGS_DISABLED_VARIANTS: Array<{
-  description: string;
-  gitHubVersion: util.GitHubVersion;
-}> = [
-  {
-    description: "GHES",
-    gitHubVersion: { type: GitHubVariant.GHES, version: "3.0.0" },
-  },
-  { description: "GHAE", gitHubVersion: { type: GitHubVariant.GHAE } },
-];
-
-for (const variant of ALL_FEATURE_FLAGS_DISABLED_VARIANTS) {
-  test(`All feature flags are disabled if running against ${variant.description}`, async (t) => {
-    await withTmpDir(async (tmpDir) => {
-      setupActionsVars(tmpDir, tmpDir);
-
-      const loggedMessages = [];
-      const featureFlags = new GitHubFeatureFlags(
-        variant.gitHubVersion,
-        testApiDetails,
-        testRepositoryNwo,
-        getRecordingLogger(loggedMessages)
-      );
-
-      for (const flag of Object.values(FeatureFlag)) {
-        t.assert((await featureFlags.getValue(flag)) === false);
-      }
-
-      t.assert(
-        loggedMessages.find(
-          (v: LoggedMessage) =>
-            v.type === "debug" &&
-            v.message ===
-              "Not running against github.com. Disabling all feature flags."
-        ) !== undefined
-      );
-    });
-  });
-}
-
-test("API response missing", async (t) => {
+test(`All features are disabled if running against GHES`, async (t) => {
   await withTmpDir(async (tmpDir) => {
-    setupActionsVars(tmpDir, tmpDir);
-
     const loggedMessages = [];
-    const featureFlags = new GitHubFeatureFlags(
-      { type: GitHubVariant.DOTCOM },
-      testApiDetails,
-      testRepositoryNwo,
-      getRecordingLogger(loggedMessages)
+    const features = setUpFeatureFlagTests(
+      tmpDir,
+      getRecordingLogger(loggedMessages),
+      { type: GitHubVariant.GHES, version: "3.0.0" },
+    );
+
+    for (const feature of Object.values(Feature)) {
+      t.deepEqual(
+        await features.getValue(feature, includeCodeQlIfRequired(feature)),
+        featureConfig[feature].defaultValue,
+      );
+    }
+
+    t.assert(
+      loggedMessages.find(
+        (v: LoggedMessage) =>
+          v.type === "debug" &&
+          v.message ===
+            "Not running against github.com. Disabling all toggleable features.",
+      ) !== undefined,
+    );
+  });
+});
+
+test(`Feature flags are requested in Proxima`, async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const loggedMessages = [];
+    const features = setUpFeatureFlagTests(
+      tmpDir,
+      getRecordingLogger(loggedMessages),
+      { type: GitHubVariant.GHE_DOTCOM },
+    );
+
+    mockFeatureFlagApiEndpoint(200, initializeFeatures(true));
+
+    for (const feature of Object.values(Feature)) {
+      // Ensure we have gotten a response value back from the Mock API
+      t.assert(
+        await features.getValue(feature, includeCodeQlIfRequired(feature)),
+      );
+    }
+
+    // And that we haven't bailed preemptively.
+    t.assert(
+      loggedMessages.find(
+        (v: LoggedMessage) =>
+          v.type === "debug" &&
+          v.message ===
+            "Not running against github.com. Disabling all toggleable features.",
+      ) === undefined,
+    );
+  });
+});
+
+test("API response missing and features use default value", async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const loggedMessages: LoggedMessage[] = [];
+    const features = setUpFeatureFlagTests(
+      tmpDir,
+      getRecordingLogger(loggedMessages),
     );
 
     mockFeatureFlagApiEndpoint(403, {});
 
-    for (const flag of Object.values(FeatureFlag)) {
-      t.assert((await featureFlags.getValue(flag)) === false);
-    }
-
-    for (const featureFlag of ["ml_powered_queries_enabled"]) {
+    for (const feature of Object.values(Feature)) {
       t.assert(
-        loggedMessages.find(
-          (v: LoggedMessage) =>
-            v.type === "debug" &&
-            v.message ===
-              `No feature flags API response for ${featureFlag}, considering it disabled.`
-        ) !== undefined
+        (await features.getValue(feature, includeCodeQlIfRequired(feature))) ===
+          featureConfig[feature].defaultValue,
       );
     }
+    assertAllFeaturesUndefinedInApi(t, loggedMessages);
   });
 });
 
-test("Feature flags are disabled if they're not returned in API response", async (t) => {
+test("Features use default value if they're not returned in API response", async (t) => {
   await withTmpDir(async (tmpDir) => {
-    setupActionsVars(tmpDir, tmpDir);
-
-    const loggedMessages = [];
-    const featureFlags = new GitHubFeatureFlags(
-      { type: GitHubVariant.DOTCOM },
-      testApiDetails,
-      testRepositoryNwo,
-      getRecordingLogger(loggedMessages)
+    const loggedMessages: LoggedMessage[] = [];
+    const features = setUpFeatureFlagTests(
+      tmpDir,
+      getRecordingLogger(loggedMessages),
     );
 
     mockFeatureFlagApiEndpoint(200, {});
 
-    for (const flag of Object.values(FeatureFlag)) {
-      t.assert((await featureFlags.getValue(flag)) === false);
-    }
-
-    for (const featureFlag of ["ml_powered_queries_enabled"]) {
+    for (const feature of Object.values(Feature)) {
       t.assert(
-        loggedMessages.find(
-          (v: LoggedMessage) =>
-            v.type === "debug" &&
-            v.message ===
-              `Feature flag '${featureFlag}' undefined in API response, considering it disabled.`
-        ) !== undefined
+        (await features.getValue(feature, includeCodeQlIfRequired(feature))) ===
+          featureConfig[feature].defaultValue,
       );
     }
+
+    assertAllFeaturesUndefinedInApi(t, loggedMessages);
   });
 });
 
 test("Feature flags exception is propagated if the API request errors", async (t) => {
   await withTmpDir(async (tmpDir) => {
-    setupActionsVars(tmpDir, tmpDir);
-
-    const featureFlags = new GitHubFeatureFlags(
-      { type: GitHubVariant.DOTCOM },
-      testApiDetails,
-      testRepositoryNwo,
-      getRunnerLogger(true)
-    );
+    const features = setUpFeatureFlagTests(tmpDir);
 
     mockFeatureFlagApiEndpoint(500, {});
 
+    const someFeature = Object.values(Feature)[0];
+
     await t.throwsAsync(
-      async () => featureFlags.getValue(FeatureFlag.MlPoweredQueriesEnabled),
+      async () =>
+        features.getValue(someFeature, includeCodeQlIfRequired(someFeature)),
       {
         message:
-          "Encountered an error while trying to load feature flags: Error: some error message",
-      }
+          "Encountered an error while trying to determine feature enablement: Error: some error message",
+      },
     );
   });
 });
 
-const FEATURE_FLAGS = ["ml_powered_queries_enabled"];
-
-for (const featureFlag of FEATURE_FLAGS) {
-  test(`Feature flag '${featureFlag}' is enabled if enabled in the API response`, async (t) => {
+for (const feature of Object.keys(featureConfig)) {
+  test(`Only feature '${feature}' is enabled if enabled in the API response. Other features disabled`, async (t) => {
     await withTmpDir(async (tmpDir) => {
-      setupActionsVars(tmpDir, tmpDir);
+      const features = setUpFeatureFlagTests(tmpDir);
 
-      const featureFlags = new GitHubFeatureFlags(
-        { type: GitHubVariant.DOTCOM },
-        testApiDetails,
-        testRepositoryNwo,
-        getRunnerLogger(true)
-      );
-
-      const expectedFeatureFlags: { [flag: string]: boolean } = {};
-      for (const f of FEATURE_FLAGS) {
-        expectedFeatureFlags[f] = false;
+      // set all features to false except the one we're testing
+      const expectedFeatureEnablement: { [feature: string]: boolean } = {};
+      for (const f of Object.keys(featureConfig)) {
+        expectedFeatureEnablement[f] = f === feature;
       }
-      expectedFeatureFlags[featureFlag] = true;
-      mockFeatureFlagApiEndpoint(200, expectedFeatureFlags);
+      mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
 
-      const actualFeatureFlags: { [flag: string]: boolean } = {
-        ml_powered_queries_enabled: await featureFlags.getValue(
-          FeatureFlag.MlPoweredQueriesEnabled
-        ),
-      };
+      // retrieve the values of the actual features
+      const actualFeatureEnablement: { [feature: string]: boolean } = {};
+      for (const f of Object.keys(featureConfig)) {
+        actualFeatureEnablement[f] = await features.getValue(
+          f as Feature,
+          includeCodeQlIfRequired(f),
+        );
+      }
 
-      t.deepEqual(actualFeatureFlags, expectedFeatureFlags);
+      // All features should be false except the one we're testing
+      t.deepEqual(actualFeatureEnablement, expectedFeatureEnablement);
     });
   });
+
+  test(`Only feature '${feature}' is enabled if the associated environment variable is true. Others disabled.`, async (t) => {
+    await withTmpDir(async (tmpDir) => {
+      const features = setUpFeatureFlagTests(tmpDir);
+
+      const expectedFeatureEnablement = initializeFeatures(false);
+      mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+      // feature should be disabled initially
+      t.assert(
+        !(await features.getValue(
+          feature as Feature,
+          includeCodeQlIfRequired(feature),
+        )),
+      );
+
+      // set env var to true and check that the feature is now enabled
+      process.env[featureConfig[feature].envVar] = "true";
+      t.assert(
+        await features.getValue(
+          feature as Feature,
+          includeCodeQlIfRequired(feature),
+        ),
+      );
+    });
+  });
+
+  test(`Feature '${feature}' is disabled if the associated environment variable is false, even if enabled in API`, async (t) => {
+    await withTmpDir(async (tmpDir) => {
+      const features = setUpFeatureFlagTests(tmpDir);
+
+      const expectedFeatureEnablement = initializeFeatures(true);
+      mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+      // feature should be enabled initially
+      t.assert(
+        await features.getValue(
+          feature as Feature,
+          includeCodeQlIfRequired(feature),
+        ),
+      );
+
+      // set env var to false and check that the feature is now disabled
+      process.env[featureConfig[feature].envVar] = "false";
+      t.assert(
+        !(await features.getValue(
+          feature as Feature,
+          includeCodeQlIfRequired(feature),
+        )),
+      );
+    });
+  });
+
+  if (
+    featureConfig[feature].minimumVersion !== undefined ||
+    featureConfig[feature].toolsFeature !== undefined
+  ) {
+    test(`Getting feature '${feature} should throw if no codeql is provided`, async (t) => {
+      await withTmpDir(async (tmpDir) => {
+        const features = setUpFeatureFlagTests(tmpDir);
+
+        const expectedFeatureEnablement = initializeFeatures(true);
+        mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+        await t.throwsAsync(async () => features.getValue(feature as Feature), {
+          message: `Internal error: A ${
+            featureConfig[feature].minimumVersion !== undefined
+              ? "minimum version"
+              : "required tools feature"
+          } is specified for feature ${feature}, but no instance of CodeQL was provided.`,
+        });
+      });
+    });
+  }
+
+  if (featureConfig[feature].minimumVersion !== undefined) {
+    test(`Feature '${feature}' is disabled if the minimum CLI version is below ${featureConfig[feature].minimumVersion}`, async (t) => {
+      await withTmpDir(async (tmpDir) => {
+        const features = setUpFeatureFlagTests(tmpDir);
+
+        const expectedFeatureEnablement = initializeFeatures(true);
+        mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+        // feature should be disabled when an old CLI version is set
+        let codeql = mockCodeQLVersion("2.0.0");
+        t.assert(!(await features.getValue(feature as Feature, codeql)));
+
+        // even setting the env var to true should not enable the feature if
+        // the minimum CLI version is not met
+        process.env[featureConfig[feature].envVar] = "true";
+        t.assert(!(await features.getValue(feature as Feature, codeql)));
+
+        // feature should be enabled when a new CLI version is set
+        // and env var is not set
+        process.env[featureConfig[feature].envVar] = "";
+        codeql = mockCodeQLVersion(
+          featureConfig[feature].minimumVersion as string,
+        );
+        t.assert(await features.getValue(feature as Feature, codeql));
+
+        // set env var to false and check that the feature is now disabled
+        process.env[featureConfig[feature].envVar] = "false";
+        t.assert(!(await features.getValue(feature as Feature, codeql)));
+      });
+    });
+  }
+
+  if (featureConfig[feature].toolsFeature !== undefined) {
+    test(`Feature '${feature}' is disabled if the required tools feature is not enabled`, async (t) => {
+      await withTmpDir(async (tmpDir) => {
+        const features = setUpFeatureFlagTests(tmpDir);
+
+        const expectedFeatureEnablement = initializeFeatures(true);
+        mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+        // feature should be disabled when the required tools feature is not enabled
+        let codeql = mockCodeQLVersion("2.0.0");
+        t.assert(!(await features.getValue(feature as Feature, codeql)));
+
+        // even setting the env var to true should not enable the feature if
+        // the required tools feature is not enabled
+        process.env[featureConfig[feature].envVar] = "true";
+        t.assert(!(await features.getValue(feature as Feature, codeql)));
+
+        // feature should be enabled when the required tools feature is enabled
+        // and env var is not set
+        process.env[featureConfig[feature].envVar] = "";
+        codeql = mockCodeQLVersion("2.0.0", {
+          [featureConfig[feature].toolsFeature]: true,
+        });
+        t.assert(await features.getValue(feature as Feature, codeql));
+
+        // set env var to false and check that the feature is now disabled
+        process.env[featureConfig[feature].envVar] = "false";
+        t.assert(!(await features.getValue(feature as Feature, codeql)));
+      });
+    });
+  }
+}
+
+test("Feature flags are saved to disk", async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const features = setUpFeatureFlagTests(tmpDir);
+    const expectedFeatureEnablement = initializeFeatures(true);
+    mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+    const cachedFeatureFlags = path.join(tmpDir, FEATURE_FLAGS_FILE_NAME);
+
+    t.false(
+      fs.existsSync(cachedFeatureFlags),
+      "Feature flag cached file should not exist before getting feature flags",
+    );
+
+    t.true(
+      await features.getValue(
+        Feature.QaTelemetryEnabled,
+        includeCodeQlIfRequired(Feature.QaTelemetryEnabled),
+      ),
+      "Feature flag should be enabled initially",
+    );
+
+    t.true(
+      fs.existsSync(cachedFeatureFlags),
+      "Feature flag cached file should exist after getting feature flags",
+    );
+
+    const actualFeatureEnablement = JSON.parse(
+      fs.readFileSync(cachedFeatureFlags, "utf8"),
+    );
+    t.deepEqual(actualFeatureEnablement, expectedFeatureEnablement);
+
+    // now test that we actually use the feature flag cache instead of the server
+    actualFeatureEnablement[Feature.QaTelemetryEnabled] = false;
+    fs.writeFileSync(
+      cachedFeatureFlags,
+      JSON.stringify(actualFeatureEnablement),
+    );
+
+    // delete the in memory cache so that we are forced to use the cached file
+    (features as any).gitHubFeatureFlags.cachedApiResponse = undefined;
+
+    t.false(
+      await features.getValue(
+        Feature.QaTelemetryEnabled,
+        includeCodeQlIfRequired(Feature.QaTelemetryEnabled),
+      ),
+      "Feature flag should be enabled after reading from cached file",
+    );
+  });
+});
+
+test("Environment variable can override feature flag cache", async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const features = setUpFeatureFlagTests(tmpDir);
+    const expectedFeatureEnablement = initializeFeatures(true);
+    mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+    const cachedFeatureFlags = path.join(tmpDir, FEATURE_FLAGS_FILE_NAME);
+    t.true(
+      await features.getValue(
+        Feature.QaTelemetryEnabled,
+        includeCodeQlIfRequired(Feature.QaTelemetryEnabled),
+      ),
+      "Feature flag should be enabled initially",
+    );
+
+    t.true(
+      fs.existsSync(cachedFeatureFlags),
+      "Feature flag cached file should exist after getting feature flags",
+    );
+    process.env.CODEQL_ACTION_QA_TELEMETRY = "false";
+
+    t.false(
+      await features.getValue(
+        Feature.QaTelemetryEnabled,
+        includeCodeQlIfRequired(Feature.QaTelemetryEnabled),
+      ),
+      "Feature flag should be disabled after setting env var",
+    );
+  });
+});
+
+test(`selects CLI from defaults.json on GHES`, async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const features = setUpFeatureFlagTests(tmpDir);
+
+    const defaultCliVersion = await features.getDefaultCliVersion(
+      GitHubVariant.GHES,
+    );
+    t.deepEqual(defaultCliVersion, {
+      cliVersion: defaults.cliVersion,
+      tagName: defaults.bundleVersion,
+    });
+  });
+});
+
+test("selects CLI v2.20.1 on Dotcom when feature flags enable v2.20.0 and v2.20.1", async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const features = setUpFeatureFlagTests(tmpDir);
+    const expectedFeatureEnablement = initializeFeatures(true);
+    expectedFeatureEnablement["default_codeql_version_2_20_0_enabled"] = true;
+    expectedFeatureEnablement["default_codeql_version_2_20_1_enabled"] = true;
+    expectedFeatureEnablement["default_codeql_version_2_20_2_enabled"] = false;
+    expectedFeatureEnablement["default_codeql_version_2_20_3_enabled"] = false;
+    expectedFeatureEnablement["default_codeql_version_2_20_4_enabled"] = false;
+    expectedFeatureEnablement["default_codeql_version_2_20_5_enabled"] = false;
+    mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+    const defaultCliVersion = await features.getDefaultCliVersion(
+      GitHubVariant.DOTCOM,
+    );
+    t.deepEqual(defaultCliVersion, {
+      cliVersion: "2.20.1",
+      tagName: "codeql-bundle-v2.20.1",
+      toolsFeatureFlagsValid: true,
+    });
+  });
+});
+
+test("includes tag name", async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const features = setUpFeatureFlagTests(tmpDir);
+    const expectedFeatureEnablement = initializeFeatures(true);
+    expectedFeatureEnablement["default_codeql_version_2_20_0_enabled"] = true;
+    mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+    const defaultCliVersion = await features.getDefaultCliVersion(
+      GitHubVariant.DOTCOM,
+    );
+    t.deepEqual(defaultCliVersion, {
+      cliVersion: "2.20.0",
+      tagName: "codeql-bundle-v2.20.0",
+      toolsFeatureFlagsValid: true,
+    });
+  });
+});
+
+test(`selects CLI from defaults.json on Dotcom when no default version feature flags are enabled`, async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const features = setUpFeatureFlagTests(tmpDir);
+    const expectedFeatureEnablement = initializeFeatures(true);
+    mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+    const defaultCliVersion = await features.getDefaultCliVersion(
+      GitHubVariant.DOTCOM,
+    );
+    t.deepEqual(defaultCliVersion, {
+      cliVersion: defaults.cliVersion,
+      tagName: defaults.bundleVersion,
+      toolsFeatureFlagsValid: false,
+    });
+  });
+});
+
+test("ignores invalid version numbers in default version feature flags", async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const loggedMessages = [];
+    const features = setUpFeatureFlagTests(
+      tmpDir,
+      getRecordingLogger(loggedMessages),
+    );
+    const expectedFeatureEnablement = initializeFeatures(true);
+    expectedFeatureEnablement["default_codeql_version_2_20_0_enabled"] = true;
+    expectedFeatureEnablement["default_codeql_version_2_20_1_enabled"] = true;
+    expectedFeatureEnablement["default_codeql_version_2_20_invalid_enabled"] =
+      true;
+    mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
+
+    const defaultCliVersion = await features.getDefaultCliVersion(
+      GitHubVariant.DOTCOM,
+    );
+    t.deepEqual(defaultCliVersion, {
+      cliVersion: "2.20.1",
+      tagName: "codeql-bundle-v2.20.1",
+      toolsFeatureFlagsValid: true,
+    });
+
+    t.assert(
+      loggedMessages.find(
+        (v: LoggedMessage) =>
+          v.type === "warning" &&
+          v.message ===
+            "Ignoring feature flag default_codeql_version_2_20_invalid_enabled as it does not specify a valid CodeQL version.",
+      ) !== undefined,
+    );
+  });
+});
+
+test("legacy feature flags should end with _enabled", async (t) => {
+  for (const [feature, config] of Object.entries(featureConfig)) {
+    if (config.legacyApi) {
+      t.assert(
+        feature.endsWith("_enabled"),
+        `legacy feature ${feature} should end with '_enabled'`,
+      );
+    }
+  }
+});
+
+test("non-legacy feature flags should not end with _enabled", async (t) => {
+  for (const [feature, config] of Object.entries(featureConfig)) {
+    if (!config.legacyApi) {
+      t.false(
+        feature.endsWith("_enabled"),
+        `non-legacy feature ${feature} should not end with '_enabled'`,
+      );
+    }
+  }
+});
+
+test("non-legacy feature flags should not start with codeql_action_", async (t) => {
+  for (const [feature, config] of Object.entries(featureConfig)) {
+    if (!config.legacyApi) {
+      t.false(
+        feature.startsWith("codeql_action_"),
+        `non-legacy feature ${feature} should not start with 'codeql_action_'`,
+      );
+    }
+  }
+});
+
+function assertAllFeaturesUndefinedInApi(
+  t: ExecutionContext<unknown>,
+  loggedMessages: LoggedMessage[],
+) {
+  for (const feature of Object.keys(featureConfig)) {
+    t.assert(
+      loggedMessages.find(
+        (v) =>
+          v.type === "debug" &&
+          (v.message as string).includes(feature) &&
+          (v.message as string).includes("undefined in API response"),
+      ) !== undefined,
+    );
+  }
+}
+
+export function initializeFeatures(initialValue: boolean) {
+  return Object.keys(featureConfig).reduce((features, key) => {
+    features[key] = initialValue;
+    return features;
+  }, {});
+}
+
+function setUpFeatureFlagTests(
+  tmpDir: string,
+  logger = getRunnerLogger(true),
+  gitHubVersion = { type: GitHubVariant.DOTCOM } as util.GitHubVersion,
+): FeatureEnablement {
+  setupActionsVars(tmpDir, tmpDir);
+
+  return new Features(gitHubVersion, testRepositoryNwo, tmpDir, logger);
+}
+
+/**
+ * Returns an argument to pass to `getValue` that if required includes a CodeQL object meeting the
+ * minimum version or tool feature requirements specified by the feature.
+ */
+function includeCodeQlIfRequired(feature: string) {
+  return featureConfig[feature].minimumVersion !== undefined ||
+    featureConfig[feature].toolsFeature !== undefined
+    ? mockCodeQLVersion(
+        "9.9.9",
+        Object.fromEntries(Object.values(ToolsFeature).map((v) => [v, true])),
+      )
+    : undefined;
 }

@@ -8,30 +8,29 @@ import * as actionsUtil from "./actions-util";
 import { GitHubApiDetails } from "./api-client";
 import * as apiClient from "./api-client";
 import { setCodeQL } from "./codeql";
-import { Config, defaultAugmentationProperties } from "./config-utils";
+import { Config } from "./config-utils";
 import { uploadDatabases } from "./database-upload";
+import * as gitUtils from "./git-utils";
 import { Language } from "./languages";
 import { RepositoryNwo } from "./repository";
 import {
+  createTestConfig,
   getRecordingLogger,
   LoggedMessage,
   setupActionsVars,
   setupTests,
 } from "./testing-utils";
 import {
-  DEFAULT_DEBUG_ARTIFACT_NAME,
-  DEFAULT_DEBUG_DATABASE_NAME,
   GitHubVariant,
   HTTPError,
   initializeEnvironment,
-  Mode,
   withTmpDir,
 } from "./util";
 
 setupTests(test);
 
 test.beforeEach(() => {
-  initializeEnvironment(Mode.actions, "1.2.3");
+  initializeEnvironment("1.2.3");
 });
 
 const testRepoName: RepositoryNwo = { owner: "github", repo: "example" };
@@ -42,24 +41,10 @@ const testApiDetails: GitHubApiDetails = {
 };
 
 function getTestConfig(tmpDir: string): Config {
-  return {
+  return createTestConfig({
     languages: [Language.javascript],
-    queries: {},
-    pathsIgnore: [],
-    paths: [],
-    originalUserInput: {},
-    tempDir: tmpDir,
-    codeQLCmd: "foo",
-    gitHubVersion: { type: GitHubVariant.DOTCOM },
     dbLocation: tmpDir,
-    packs: {},
-    debugMode: false,
-    debugArtifactName: DEFAULT_DEBUG_ARTIFACT_NAME,
-    debugDatabaseName: DEFAULT_DEBUG_DATABASE_NAME,
-    augmentationProperties: defaultAugmentationProperties,
-    trapCaches: {},
-    trapCacheDownloadTime: 0,
-  };
+  });
 }
 
 async function mockHttpRequests(databaseUploadStatusCode: number) {
@@ -69,17 +54,19 @@ async function mockHttpRequests(databaseUploadStatusCode: number) {
   const requestSpy = sinon.stub(client, "request");
 
   const url =
-    "POST https://uploads.github.com/repos/:owner/:repo/code-scanning/codeql/databases/:language?name=:name";
+    "POST /repos/:owner/:repo/code-scanning/codeql/databases/:language?name=:name&commit_oid=:commit_oid";
   const databaseUploadSpy = requestSpy.withArgs(url);
   if (databaseUploadStatusCode < 300) {
     databaseUploadSpy.resolves(undefined);
   } else {
     databaseUploadSpy.throws(
-      new HTTPError("some error message", databaseUploadStatusCode)
+      new HTTPError("some error message", databaseUploadStatusCode),
     );
   }
 
   sinon.stub(apiClient, "getApiClient").value(() => client);
+
+  return databaseUploadSpy;
 }
 
 test("Abort database upload if 'upload-database' input set to false", async (t) => {
@@ -89,21 +76,22 @@ test("Abort database upload if 'upload-database' input set to false", async (t) 
       .stub(actionsUtil, "getRequiredInput")
       .withArgs("upload-database")
       .returns("false");
-    sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(true);
+    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
 
     const loggedMessages = [];
     await uploadDatabases(
       testRepoName,
       getTestConfig(tmpDir),
       testApiDetails,
-      getRecordingLogger(loggedMessages)
+      getRecordingLogger(loggedMessages),
     );
     t.assert(
       loggedMessages.find(
         (v: LoggedMessage) =>
           v.type === "debug" &&
-          v.message === "Database upload disabled in workflow. Skipping upload."
-      ) !== undefined
+          v.message ===
+            "Database upload disabled in workflow. Skipping upload.",
+      ) !== undefined,
     );
   });
 });
@@ -115,7 +103,7 @@ test("Abort database upload if running against GHES", async (t) => {
       .stub(actionsUtil, "getRequiredInput")
       .withArgs("upload-database")
       .returns("true");
-    sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(true);
+    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
 
     const config = getTestConfig(tmpDir);
     config.gitHubVersion = { type: GitHubVariant.GHES, version: "3.0" };
@@ -125,43 +113,15 @@ test("Abort database upload if running against GHES", async (t) => {
       testRepoName,
       config,
       testApiDetails,
-      getRecordingLogger(loggedMessages)
+      getRecordingLogger(loggedMessages),
     );
     t.assert(
       loggedMessages.find(
         (v: LoggedMessage) =>
           v.type === "debug" &&
-          v.message === "Not running against github.com. Skipping upload."
-      ) !== undefined
-    );
-  });
-});
-
-test("Abort database upload if running against GHAE", async (t) => {
-  await withTmpDir(async (tmpDir) => {
-    setupActionsVars(tmpDir, tmpDir);
-    sinon
-      .stub(actionsUtil, "getRequiredInput")
-      .withArgs("upload-database")
-      .returns("true");
-    sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(true);
-
-    const config = getTestConfig(tmpDir);
-    config.gitHubVersion = { type: GitHubVariant.GHAE };
-
-    const loggedMessages = [];
-    await uploadDatabases(
-      testRepoName,
-      config,
-      testApiDetails,
-      getRecordingLogger(loggedMessages)
-    );
-    t.assert(
-      loggedMessages.find(
-        (v: LoggedMessage) =>
-          v.type === "debug" &&
-          v.message === "Not running against github.com. Skipping upload."
-      ) !== undefined
+          v.message ===
+            "Not running against github.com or GHEC-DR. Skipping upload.",
+      ) !== undefined,
     );
   });
 });
@@ -173,21 +133,21 @@ test("Abort database upload if not analyzing default branch", async (t) => {
       .stub(actionsUtil, "getRequiredInput")
       .withArgs("upload-database")
       .returns("true");
-    sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(false);
+    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(false);
 
     const loggedMessages = [];
     await uploadDatabases(
       testRepoName,
       getTestConfig(tmpDir),
       testApiDetails,
-      getRecordingLogger(loggedMessages)
+      getRecordingLogger(loggedMessages),
     );
     t.assert(
       loggedMessages.find(
         (v: LoggedMessage) =>
           v.type === "debug" &&
-          v.message === "Not analyzing default branch. Skipping upload."
-      ) !== undefined
+          v.message === "Not analyzing default branch. Skipping upload.",
+      ) !== undefined,
     );
   });
 });
@@ -199,7 +159,7 @@ test("Don't crash if uploading a database fails", async (t) => {
       .stub(actionsUtil, "getRequiredInput")
       .withArgs("upload-database")
       .returns("true");
-    sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(true);
+    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
 
     await mockHttpRequests(500);
 
@@ -214,7 +174,7 @@ test("Don't crash if uploading a database fails", async (t) => {
       testRepoName,
       getTestConfig(tmpDir),
       testApiDetails,
-      getRecordingLogger(loggedMessages)
+      getRecordingLogger(loggedMessages),
     );
 
     t.assert(
@@ -222,20 +182,20 @@ test("Don't crash if uploading a database fails", async (t) => {
         (v) =>
           v.type === "warning" &&
           v.message ===
-            "Failed to upload database for javascript: Error: some error message"
-      ) !== undefined
+            "Failed to upload database for javascript: Error: some error message",
+      ) !== undefined,
     );
   });
 });
 
-test("Successfully uploading a database to api.github.com", async (t) => {
+test("Successfully uploading a database to github.com", async (t) => {
   await withTmpDir(async (tmpDir) => {
     setupActionsVars(tmpDir, tmpDir);
     sinon
       .stub(actionsUtil, "getRequiredInput")
       .withArgs("upload-database")
       .returns("true");
-    sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(true);
+    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
 
     await mockHttpRequests(201);
 
@@ -250,28 +210,28 @@ test("Successfully uploading a database to api.github.com", async (t) => {
       testRepoName,
       getTestConfig(tmpDir),
       testApiDetails,
-      getRecordingLogger(loggedMessages)
+      getRecordingLogger(loggedMessages),
     );
     t.assert(
       loggedMessages.find(
         (v) =>
           v.type === "debug" &&
-          v.message === "Successfully uploaded database for javascript"
-      ) !== undefined
+          v.message === "Successfully uploaded database for javascript",
+      ) !== undefined,
     );
   });
 });
 
-test("Successfully uploading a database to uploads.github.com", async (t) => {
+test("Successfully uploading a database to GHEC-DR", async (t) => {
   await withTmpDir(async (tmpDir) => {
     setupActionsVars(tmpDir, tmpDir);
     sinon
       .stub(actionsUtil, "getRequiredInput")
       .withArgs("upload-database")
       .returns("true");
-    sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(true);
+    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
 
-    await mockHttpRequests(201);
+    const databaseUploadSpy = await mockHttpRequests(201);
 
     setCodeQL({
       async databaseBundle(_: string, outputFilePath: string) {
@@ -283,15 +243,25 @@ test("Successfully uploading a database to uploads.github.com", async (t) => {
     await uploadDatabases(
       testRepoName,
       getTestConfig(tmpDir),
-      testApiDetails,
-      getRecordingLogger(loggedMessages)
+      {
+        auth: "1234",
+        url: "https://tenant.ghe.com",
+        apiURL: undefined,
+      },
+      getRecordingLogger(loggedMessages),
     );
     t.assert(
       loggedMessages.find(
         (v) =>
           v.type === "debug" &&
-          v.message === "Successfully uploaded database for javascript"
-      ) !== undefined
+          v.message === "Successfully uploaded database for javascript",
+      ) !== undefined,
+    );
+    t.assert(
+      databaseUploadSpy.calledOnceWith(
+        sinon.match.string,
+        sinon.match.has("baseUrl", "https://uploads.tenant.ghe.com"),
+      ),
     );
   });
 });
