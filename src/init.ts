@@ -2,86 +2,128 @@ import * as fs from "fs";
 import * as path from "path";
 
 import * as toolrunner from "@actions/exec/lib/toolrunner";
-import * as safeWhich from "@chrisgavin/safe-which";
+import * as io from "@actions/io";
+import * as semver from "semver";
 
-import * as analysisPaths from "./analysis-paths";
+import { getOptionalInput, isSelfHostedRunner } from "./actions-util";
 import { GitHubApiCombinedDetails, GitHubApiDetails } from "./api-client";
-import { CodeQL, CODEQL_VERSION_NEW_TRACING, setupCodeQL } from "./codeql";
+import { CodeQL, setupCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
-import { FeatureFlags } from "./feature-flags";
+import { CodeQLDefaultVersionInfo, FeatureEnablement } from "./feature-flags";
+import { getGitRoot } from "./git-utils";
+import { Language, isScannedLanguage } from "./languages";
 import { Logger } from "./logging";
-import { RepositoryNwo } from "./repository";
+import {
+  CODEQL_OVERLAY_MINIMUM_VERSION,
+  OverlayDatabaseMode,
+} from "./overlay-database-utils";
+import { ToolsSource } from "./setup-codeql";
+import { ZstdAvailability } from "./tar";
+import { ToolsDownloadStatusReport } from "./tools-download";
+import { ToolsFeature } from "./tools-features";
 import { TracerConfig, getCombinedTracerConfig } from "./tracer-config";
 import * as util from "./util";
-import { codeQlVersionAbove } from "./util";
 
 export async function initCodeQL(
-  codeqlURL: string | undefined,
+  toolsInput: string | undefined,
   apiDetails: GitHubApiDetails,
   tempDir: string,
   variant: util.GitHubVariant,
-  featureFlags: FeatureFlags,
-  logger: Logger
-): Promise<{ codeql: CodeQL; toolsVersion: string }> {
+  defaultCliVersion: CodeQLDefaultVersionInfo,
+  features: FeatureEnablement,
+  logger: Logger,
+): Promise<{
+  codeql: CodeQL;
+  toolsDownloadStatusReport?: ToolsDownloadStatusReport;
+  toolsSource: ToolsSource;
+  toolsVersion: string;
+  zstdAvailability: ZstdAvailability;
+}> {
   logger.startGroup("Setup CodeQL tools");
-  const { codeql, toolsVersion } = await setupCodeQL(
-    codeqlURL,
+  const {
+    codeql,
+    toolsDownloadStatusReport,
+    toolsSource,
+    toolsVersion,
+    zstdAvailability,
+  } = await setupCodeQL(
+    toolsInput,
     apiDetails,
     tempDir,
     variant,
-    featureFlags,
+    defaultCliVersion,
     logger,
-    true
+    features,
+    true,
   );
   await codeql.printVersion();
   logger.endGroup();
-  return { codeql, toolsVersion };
+  return {
+    codeql,
+    toolsDownloadStatusReport,
+    toolsSource,
+    toolsVersion,
+    zstdAvailability,
+  };
 }
 
 export async function initConfig(
-  languagesInput: string | undefined,
-  queriesInput: string | undefined,
-  packsInput: string | undefined,
-  registriesInput: string | undefined,
-  configFile: string | undefined,
-  dbLocation: string | undefined,
-  trapCachingEnabled: boolean,
-  debugMode: boolean,
-  debugArtifactName: string,
-  debugDatabaseName: string,
-  repository: RepositoryNwo,
-  tempDir: string,
-  codeQL: CodeQL,
-  workspacePath: string,
-  gitHubVersion: util.GitHubVersion,
-  apiDetails: GitHubApiCombinedDetails,
-  featureFlags: FeatureFlags,
-  logger: Logger
+  inputs: configUtils.InitConfigInputs,
+  codeql: CodeQL,
 ): Promise<configUtils.Config> {
+  const logger = inputs.logger;
   logger.startGroup("Load language configuration");
-  const config = await configUtils.initConfig(
-    languagesInput,
-    queriesInput,
-    packsInput,
-    registriesInput,
-    configFile,
-    dbLocation,
-    trapCachingEnabled,
-    debugMode,
-    debugArtifactName,
-    debugDatabaseName,
-    repository,
-    tempDir,
-    codeQL,
-    workspacePath,
-    gitHubVersion,
-    apiDetails,
-    featureFlags,
-    logger
-  );
-  analysisPaths.printPathFiltersWarning(config, logger);
+  const config = await configUtils.initConfig(inputs);
+  if (
+    !(await codeql.supportsFeature(
+      ToolsFeature.InformsAboutUnsupportedPathFilters,
+    ))
+  ) {
+    printPathFiltersWarning(config, logger);
+  }
   logger.endGroup();
   return config;
+}
+
+export async function getOverlayDatabaseMode(
+  codeqlVersion: string,
+  config: configUtils.Config,
+  sourceRoot: string,
+  logger: Logger,
+): Promise<OverlayDatabaseMode> {
+  const overlayDatabaseMode = process.env.CODEQL_OVERLAY_DATABASE_MODE;
+
+  if (
+    overlayDatabaseMode === OverlayDatabaseMode.Overlay ||
+    overlayDatabaseMode === OverlayDatabaseMode.OverlayBase
+  ) {
+    if (config.buildMode !== util.BuildMode.None) {
+      logger.warning(
+        `Cannot build an ${overlayDatabaseMode} database because ` +
+          `build-mode is set to "${config.buildMode}" instead of "none". ` +
+          "Falling back to creating a normal full database instead.",
+      );
+      return OverlayDatabaseMode.None;
+    }
+    if (semver.lt(codeqlVersion, CODEQL_OVERLAY_MINIMUM_VERSION)) {
+      logger.warning(
+        `Cannot build an ${overlayDatabaseMode} database because ` +
+          `the CodeQL CLI is older than ${CODEQL_OVERLAY_MINIMUM_VERSION}. ` +
+          "Falling back to creating a normal full database instead.",
+      );
+      return OverlayDatabaseMode.None;
+    }
+    if ((await getGitRoot(sourceRoot)) === undefined) {
+      logger.warning(
+        `Cannot build an ${overlayDatabaseMode} database because ` +
+          `the source root "${sourceRoot}" is not inside a git repository. ` +
+          "Falling back to creating a normal full database instead.",
+      );
+      return OverlayDatabaseMode.None;
+    }
+    return overlayDatabaseMode as OverlayDatabaseMode;
+  }
+  return OverlayDatabaseMode.None;
 }
 
 export async function runInit(
@@ -89,199 +131,128 @@ export async function runInit(
   config: configUtils.Config,
   sourceRoot: string,
   processName: string | undefined,
-  processLevel: number | undefined,
-  featureFlags: FeatureFlags,
-  logger: Logger
+  registriesInput: string | undefined,
+  apiDetails: GitHubApiCombinedDetails,
+  overlayDatabaseMode: OverlayDatabaseMode,
+  logger: Logger,
 ): Promise<TracerConfig | undefined> {
   fs.mkdirSync(config.dbLocation, { recursive: true });
 
-  try {
-    if (await codeQlVersionAbove(codeql, CODEQL_VERSION_NEW_TRACING)) {
-      // Init a database cluster
+  const { registriesAuthTokens, qlconfigFile } =
+    await configUtils.generateRegistries(
+      registriesInput,
+      config.tempDir,
+      logger,
+    );
+  await configUtils.wrapEnvironment(
+    {
+      GITHUB_TOKEN: apiDetails.auth,
+      CODEQL_REGISTRIES_AUTH: registriesAuthTokens,
+    },
+
+    // Init a database cluster
+    async () =>
       await codeql.databaseInitCluster(
         config,
         sourceRoot,
         processName,
-        processLevel,
-        featureFlags,
-        logger
+        qlconfigFile,
+        overlayDatabaseMode,
+        logger,
+      ),
+  );
+  return await getCombinedTracerConfig(codeql, config);
+}
+
+export function printPathFiltersWarning(
+  config: configUtils.Config,
+  logger: Logger,
+) {
+  // Index include/exclude/filters only work in javascript/python/ruby.
+  // If any other languages are detected/configured then show a warning.
+  if (
+    (config.originalUserInput.paths?.length ||
+      config.originalUserInput["paths-ignore"]?.length) &&
+    !config.languages.every(isScannedLanguage)
+  ) {
+    logger.warning(
+      'The "paths"/"paths-ignore" fields of the config only have effect for JavaScript, Python, and Ruby',
+    );
+  }
+}
+
+/**
+ * If we are running python 3.12+ on windows, we need to switch to python 3.11.
+ * This check happens in a powershell script.
+ */
+export async function checkInstallPython311(
+  languages: Language[],
+  codeql: CodeQL,
+) {
+  if (
+    languages.includes(Language.python) &&
+    process.platform === "win32" &&
+    !(await codeql.getVersion()).features?.supportsPython312
+  ) {
+    const script = path.resolve(
+      __dirname,
+      "../python-setup",
+      "check_python12.ps1",
+    );
+    await new toolrunner.ToolRunner(await io.which("powershell", true), [
+      script,
+    ]).exec();
+  }
+}
+
+export function cleanupDatabaseClusterDirectory(
+  config: configUtils.Config,
+  logger: Logger,
+  // We can't stub the fs module in tests, so we allow the caller to override the rmSync function
+  // for testing.
+  rmSync = fs.rmSync,
+): void {
+  if (
+    fs.existsSync(config.dbLocation) &&
+    (fs.statSync(config.dbLocation).isFile() ||
+      fs.readdirSync(config.dbLocation).length)
+  ) {
+    logger.warning(
+      `The database cluster directory ${config.dbLocation} must be empty. Attempting to clean it up.`,
+    );
+    try {
+      rmSync(config.dbLocation, {
+        force: true,
+        maxRetries: 3,
+        recursive: true,
+      });
+
+      logger.info(
+        `Cleaned up database cluster directory ${config.dbLocation}.`,
       );
-    } else {
-      for (const language of config.languages) {
-        // Init language database
-        await codeql.databaseInit(
-          util.getCodeQLDatabasePath(config, language),
-          language,
-          sourceRoot
+    } catch (e) {
+      const blurb = `The CodeQL Action requires an empty database cluster directory. ${
+        getOptionalInput("db-location")
+          ? `This is currently configured to be ${config.dbLocation}. `
+          : `By default, this is located at ${config.dbLocation}. ` +
+            "You can customize it using the 'db-location' input to the init Action. "
+      }An attempt was made to clean up the directory, but this failed.`;
+
+      // Hosted runners are automatically cleaned up, so this error should not occur for hosted runners.
+      if (isSelfHostedRunner()) {
+        throw new util.ConfigurationError(
+          `${blurb} This can happen if another process is using the directory or the directory is owned by a different user. ` +
+            `Please clean up the directory manually and rerun the job. Details: ${util.getErrorMessage(
+              e,
+            )}`,
+        );
+      } else {
+        throw new Error(
+          `${blurb} This shouldn't typically happen on hosted runners. ` +
+            "If you are using an advanced setup, please check your workflow, otherwise we " +
+            `recommend rerunning the job. Details: ${util.getErrorMessage(e)}`,
         );
       }
     }
-  } catch (e) {
-    // Handle the situation where init is called twice
-    // for the same database in the same job.
-    if (
-      e instanceof Error &&
-      e.message?.includes("Refusing to create databases") &&
-      e.message.includes("exists and is not an empty directory.")
-    ) {
-      throw new util.UserError(
-        `Is the "init" action called twice in the same job? ${e.message}`
-      );
-    } else if (
-      e instanceof Error &&
-      e.message?.includes("is not compatible with this CodeQL CLI")
-    ) {
-      throw new util.UserError(e.message);
-    } else {
-      throw e;
-    }
   }
-  return await getCombinedTracerConfig(
-    config,
-    codeql,
-    await util.isGoExtractionReconciliationEnabled(featureFlags),
-    logger
-  );
-}
-
-// Runs a powershell script to inject the tracer into a parent process
-// so it can tracer future processes, hopefully including the build process.
-// If processName is given then injects into the nearest parent process with
-// this name, otherwise uses the processLevel-th parent if defined, otherwise
-// defaults to the 3rd parent as a rough guess.
-export async function injectWindowsTracer(
-  processName: string | undefined,
-  processLevel: number | undefined,
-  config: configUtils.Config,
-  codeql: CodeQL,
-  tracerConfig: TracerConfig
-) {
-  let script: string;
-  if (processName !== undefined) {
-    script = `
-      Param(
-          [Parameter(Position=0)]
-          [String]
-          $tracer
-      )
-
-      $id = $PID
-      while ($true) {
-        $p = Get-CimInstance -Class Win32_Process -Filter "ProcessId = $id"
-        Write-Host "Found process: $p"
-        if ($p -eq $null) {
-          throw "Could not determine ${processName} process"
-        }
-        if ($p[0].Name -eq "${processName}") {
-          Break
-        } else {
-          $id = $p[0].ParentProcessId
-        }
-      }
-      Write-Host "Final process: $p"
-
-      Invoke-Expression "&$tracer --inject=$id"`;
-  } else {
-    // If the level is not defined then guess at the 3rd parent process.
-    // This won't be correct in every setting but it should be enough in most settings,
-    // and overestimating is likely better in this situation so we definitely trace
-    // what we want, though this does run the risk of interfering with future CI jobs.
-    // Note that the default of 3 doesn't work on github actions, so we include a
-    // special case in the script that checks for Runner.Worker.exe so we can still work
-    // on actions if the runner is invoked there.
-    processLevel = processLevel || 3;
-    script = `
-      Param(
-          [Parameter(Position=0)]
-          [String]
-          $tracer
-      )
-
-      $id = $PID
-      for ($i = 0; $i -le ${processLevel}; $i++) {
-        $p = Get-CimInstance -Class Win32_Process -Filter "ProcessId = $id"
-        Write-Host "Parent process \${i}: $p"
-        if ($p -eq $null) {
-          throw "Process tree ended before reaching required level"
-        }
-        # Special case just in case the runner is used on actions
-        if ($p[0].Name -eq "Runner.Worker.exe") {
-          Write-Host "Found Runner.Worker.exe process which means we are running on GitHub Actions"
-          Write-Host "Aborting search early and using process: $p"
-          Break
-        } elseif ($p[0].Name -eq "Agent.Worker.exe") {
-          Write-Host "Found Agent.Worker.exe process which means we are running on Azure Pipelines"
-          Write-Host "Aborting search early and using process: $p"
-          Break
-        } else {
-          $id = $p[0].ParentProcessId
-        }
-      }
-      Write-Host "Final process: $p"
-
-      Invoke-Expression "&$tracer --inject=$id"`;
-  }
-
-  const injectTracerPath = path.join(config.tempDir, "inject-tracer.ps1");
-  fs.writeFileSync(injectTracerPath, script);
-
-  await new toolrunner.ToolRunner(
-    await safeWhich.safeWhich("powershell"),
-    [
-      "-ExecutionPolicy",
-      "Bypass",
-      "-file",
-      injectTracerPath,
-      path.resolve(
-        path.dirname(codeql.getPath()),
-        "tools",
-        "win64",
-        "tracer.exe"
-      ),
-    ],
-    { env: { ODASA_TRACER_CONFIGURATION: tracerConfig.spec } }
-  ).exec();
-}
-
-export async function installPythonDeps(codeql: CodeQL, logger: Logger) {
-  logger.startGroup("Setup Python dependencies");
-
-  const scriptsFolder = path.resolve(__dirname, "../python-setup");
-
-  try {
-    if (process.platform === "win32") {
-      await new toolrunner.ToolRunner(await safeWhich.safeWhich("powershell"), [
-        path.join(scriptsFolder, "install_tools.ps1"),
-      ]).exec();
-    } else {
-      await new toolrunner.ToolRunner(
-        path.join(scriptsFolder, "install_tools.sh")
-      ).exec();
-    }
-    const script = "auto_install_packages.py";
-    if (process.platform === "win32") {
-      await new toolrunner.ToolRunner(await safeWhich.safeWhich("py"), [
-        "-3",
-        "-B",
-        path.join(scriptsFolder, script),
-        path.dirname(codeql.getPath()),
-      ]).exec();
-    } else {
-      await new toolrunner.ToolRunner(await safeWhich.safeWhich("python3"), [
-        "-B",
-        path.join(scriptsFolder, script),
-        path.dirname(codeql.getPath()),
-      ]).exec();
-    }
-  } catch (e) {
-    logger.endGroup();
-    logger.warning(
-      `An error occurred while trying to automatically install Python dependencies: ${e}\n` +
-        "Please make sure any necessary dependencies are installed before calling the codeql-action/analyze " +
-        "step, and add a 'setup-python-dependencies: false' argument to this step to disable our automatic " +
-        "dependency installation and avoid this warning."
-    );
-    return;
-  }
-  logger.endGroup();
 }

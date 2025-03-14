@@ -1,7 +1,7 @@
 'use strict'
 
 const { EventEmitter } = require('events')
-const debug = require('debug')('nock.socket')
+const { socket: debug } = require('./debug')
 
 module.exports = class Socket extends EventEmitter {
   constructor(options) {
@@ -40,6 +40,7 @@ module.exports = class Socket extends EventEmitter {
   resume() {}
   ref() {}
   unref() {}
+  write() {}
 
   address() {
     return {
@@ -73,7 +74,7 @@ module.exports = class Socket extends EventEmitter {
 
   getPeerCertificate() {
     return Buffer.from(
-      (Math.random() * 10000 + Date.now()).toString()
+      (Math.random() * 10000 + Date.now()).toString(),
     ).toString('base64')
   }
 

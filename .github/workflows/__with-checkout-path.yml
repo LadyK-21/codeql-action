@@ -1,6 +1,6 @@
 # Warning: This file is generated automatically, and should not be modified.
 # Instead, please modify the template in the pr-checks directory and run:
-#     pip install ruamel.yaml && python3 sync.py
+#     (cd pr-checks; pip install ruamel.yaml@0.17.31 && python3 sync.py)
 # to regenerate this file.
 
 name: PR Check - Use a custom `checkout_path`
@@ -10,139 +10,105 @@ env:
 on:
   push:
     branches:
-    - main
-    - releases/v1
-    - releases/v2
+      - main
+      - releases/v*
   pull_request:
     types:
-    - opened
-    - synchronize
-    - reopened
-    - ready_for_review
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  schedule:
+    - cron: '0 5 * * *'
   workflow_dispatch: {}
 jobs:
   with-checkout-path:
     strategy:
+      fail-fast: false
       matrix:
         include:
-        - os: ubuntu-latest
-          version: stable-20210308
-        - os: macos-latest
-          version: stable-20210308
-        - os: windows-2019
-          version: stable-20210308
-        - os: ubuntu-latest
-          version: stable-20210319
-        - os: macos-latest
-          version: stable-20210319
-        - os: windows-2019
-          version: stable-20210319
-        - os: ubuntu-latest
-          version: stable-20210809
-        - os: macos-latest
-          version: stable-20210809
-        - os: windows-2019
-          version: stable-20210809
-        - os: ubuntu-latest
-          version: cached
-        - os: macos-latest
-          version: cached
-        - os: windows-2019
-          version: cached
-        - os: ubuntu-latest
-          version: latest
-        - os: macos-latest
-          version: latest
-        - os: windows-2019
-          version: latest
-        - os: windows-2022
-          version: latest
-        - os: ubuntu-latest
-          version: nightly-latest
-        - os: macos-latest
-          version: nightly-latest
-        - os: windows-2019
-          version: nightly-latest
-        - os: windows-2022
-          version: nightly-latest
+          - os: ubuntu-latest
+            version: linked
+          - os: macos-latest
+            version: linked
+          - os: windows-latest
+            version: linked
     name: Use a custom `checkout_path`
+    permissions:
+      contents: read
+      security-events: read
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
-    - name: Check out repository
-      uses: actions/checkout@v3
-    - name: Prepare test
-      id: prepare-test
-      uses: ./.github/prepare-test
-      with:
-        version: ${{ matrix.version }}
-    - uses: actions/checkout@v3
-      with:
-        ref: 474bbf07f9247ffe1856c6a0f94aeeb10e7afee6
-        path: x/y/z/some-path
-    - uses: ./../action/init
-      with:
-        tools: ${{ steps.prepare-test.outputs.tools-url }}
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Prepare test
+        id: prepare-test
+        uses: ./.github/actions/prepare-test
+        with:
+          version: ${{ matrix.version }}
+          use-all-platform-bundle: 'false'
+          setup-kotlin: 'true'
+      - name: Delete original checkout
+        shell: bash
+        run: |
+          # delete the original checkout so we don't accidentally use it.
+          # Actions does not support deleting the current working directory, so we
+          # delete the contents of the directory instead.
+          rm -rf ./* .github .git
+  # Check out the actions repo again, but at a different location.
+  # choose an arbitrary SHA so that we can later test that the commit_oid is not from main
+      - uses: actions/checkout@v4
+        with:
+          ref: 474bbf07f9247ffe1856c6a0f94aeeb10e7afee6
+          path: x/y/z/some-path
+
+      - uses: ./../action/init
+        with:
+          tools: ${{ steps.prepare-test.outputs.tools-url }}
       # it's enough to test one compiled language and one interpreted language
-        languages: csharp,javascript
-        source-path: x/y/z/some-path/tests/multi-language-repo
-        debug: true
-      env:
-        TEST_MODE: true
-    - name: Build code (non-windows)
-      shell: bash
-      if: ${{ runner.os != 'Windows' }}
-      run: |
-        $CODEQL_RUNNER x/y/z/some-path/tests/multi-language-repo/build.sh
-    - name: Build code (windows)
-      shell: bash
-      if: ${{ runner.os == 'Windows' }}
-      run: |
-        x/y/z/some-path/tests/multi-language-repo/build.sh
-    - uses: ./../action/analyze
-      with:
-        checkout_path: x/y/z/some-path/tests/multi-language-repo
-        ref: v1.1.0
-        sha: 474bbf07f9247ffe1856c6a0f94aeeb10e7afee6
-        upload: false
-      env:
-        TEST_MODE: true
+          languages: csharp,javascript
+          source-root: x/y/z/some-path/tests/multi-language-repo
 
-    - uses: ./../action/upload-sarif
-      with:
-        ref: v1.1.0
-        sha: 474bbf07f9247ffe1856c6a0f94aeeb10e7afee6
-        checkout_path: x/y/z/some-path/tests/multi-language-repo
-      env:
-        TEST_MODE: true
+      - name: Build code
+        shell: bash
+        working-directory: x/y/z/some-path/tests/multi-language-repo
+        run: |
+          ./build.sh
 
-    - name: Verify SARIF after upload
-      shell: bash
-      run: |
-        EXPECTED_COMMIT_OID="474bbf07f9247ffe1856c6a0f94aeeb10e7afee6"
-        EXPECTED_REF="v1.1.0"
-        EXPECTED_CHECKOUT_URI_SUFFIX="/x/y/z/some-path/tests/multi-language-repo"
+      - uses: ./../action/analyze
+        with:
+          checkout_path: x/y/z/some-path/tests/multi-language-repo
+          ref: v1.1.0
+          sha: 474bbf07f9247ffe1856c6a0f94aeeb10e7afee6
 
-        ACTUAL_COMMIT_OID="$(cat "$RUNNER_TEMP/payload.json" | jq -r .commit_oid)"
-        ACTUAL_REF="$(cat "$RUNNER_TEMP/payload.json" | jq -r .ref)"
-        ACTUAL_CHECKOUT_URI="$(cat "$RUNNER_TEMP/payload.json" | jq -r .checkout_uri)"
+      - name: Verify SARIF after upload
+        shell: bash
+        run: |
+          EXPECTED_COMMIT_OID="474bbf07f9247ffe1856c6a0f94aeeb10e7afee6"
+          EXPECTED_REF="v1.1.0"
+          EXPECTED_CHECKOUT_URI_SUFFIX="/x/y/z/some-path/tests/multi-language-repo"
 
-        if [[ "$EXPECTED_COMMIT_OID" != "$ACTUAL_COMMIT_OID" ]]; then
-          echo "::error Invalid commit oid. Expected: $EXPECTED_COMMIT_OID Actual: $ACTUAL_COMMIT_OID"
-          echo "$RUNNER_TEMP/payload.json"
-          exit 1
-        fi
+          ACTUAL_COMMIT_OID="$(cat "$RUNNER_TEMP/payload.json" | jq -r .commit_oid)"
+          ACTUAL_REF="$(cat "$RUNNER_TEMP/payload.json" | jq -r .ref)"
+          ACTUAL_CHECKOUT_URI="$(cat "$RUNNER_TEMP/payload.json" | jq -r .checkout_uri)"
 
-        if [[ "$EXPECTED_REF" != "$ACTUAL_REF" ]]; then
-          echo "::error Invalid ref. Expected: '$EXPECTED_REF' Actual: '$ACTUAL_REF'"
-          echo "$RUNNER_TEMP/payload.json"
-          exit 1
-        fi
+          if [[ "$EXPECTED_COMMIT_OID" != "$ACTUAL_COMMIT_OID" ]]; then
+            echo "::error Invalid commit oid. Expected: $EXPECTED_COMMIT_OID Actual: $ACTUAL_COMMIT_OID"
+            echo "$RUNNER_TEMP/payload.json"
+            exit 1
+          fi
 
-        if [[ "$ACTUAL_CHECKOUT_URI" != *$EXPECTED_CHECKOUT_URI_SUFFIX ]]; then
-          echo "::error Invalid checkout URI suffix. Expected suffix: $EXPECTED_CHECKOUT_URI_SUFFIX Actual uri: $ACTUAL_CHECKOUT_URI"
-          echo "$RUNNER_TEMP/payload.json"
-          exit 1
-        fi
+          if [[ "$EXPECTED_REF" != "$ACTUAL_REF" ]]; then
+            echo "::error Invalid ref. Expected: '$EXPECTED_REF' Actual: '$ACTUAL_REF'"
+            echo "$RUNNER_TEMP/payload.json"
+            exit 1
+          fi
+
+          if [[ "$ACTUAL_CHECKOUT_URI" != *$EXPECTED_CHECKOUT_URI_SUFFIX ]]; then
+            echo "::error Invalid checkout URI suffix. Expected suffix: $EXPECTED_CHECKOUT_URI_SUFFIX Actual uri: $ACTUAL_CHECKOUT_URI"
+            echo "$RUNNER_TEMP/payload.json"
+            exit 1
+          fi
     env:
-      INTERNAL_CODEQL_ACTION_DEBUG_LOC: true
+      CODEQL_ACTION_TEST_MODE: true

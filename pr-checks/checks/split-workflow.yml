@@ -1,16 +1,14 @@
 name: "Split workflow"
 description: "Tests a split-up workflow in which we first build a database and later analyze it"
-os: ["ubuntu-latest", "macos-latest"]
-versions: ["latest", "cached", "nightly-latest"] # This feature is not compatible with old CLIs
+operatingSystems: ["ubuntu", "macos"]
+versions: ["linked", "default", "nightly-latest"] # This feature is not compatible with old CLIs
 steps:
   - uses: ./../action/init
     with:
       config-file: ".github/codeql/codeql-config-packaging3.yml"
-      packs: +dsp-testing/codeql-pack1@1.0.0
+      packs: +codeql-testing/codeql-pack1@1.0.0
       languages: javascript
       tools: ${{ steps.prepare-test.outputs.tools-url }}
-    env:
-      TEST_MODE: true
   - name: Build code
     shell: bash
     run: ./build.sh
@@ -18,8 +16,7 @@ steps:
     with:
       skip-queries: true
       output: "${{ runner.temp }}/results"
-    env:
-      TEST_MODE: true
+      upload-database: false
 
   - name: Assert No Results
     shell: bash
@@ -32,8 +29,6 @@ steps:
     with:
       output: "${{ runner.temp }}/results"
       upload-database: false
-    env:
-      TEST_MODE: true
   - name: Assert Results
     shell: bash
     run: |

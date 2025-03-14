@@ -3,7 +3,10 @@ import * as sinon from "sinon";
 
 import * as actionsUtil from "./actions-util";
 import * as analyze from "./analyze";
+import * as api from "./api-client";
 import * as configUtils from "./config-utils";
+import * as gitUtils from "./git-utils";
+import * as statusReport from "./status-report";
 import {
   setupTests,
   setupActionsVars,
@@ -26,9 +29,11 @@ test("analyze action with RAM & threads from environment variables", async (t) =
     process.env["GITHUB_REPOSITORY"] = "github/codeql-action-fake-repository";
     process.env["GITHUB_API_URL"] = "https://api.github.com";
     sinon
-      .stub(actionsUtil, "createStatusReportBase")
-      .resolves({} as actionsUtil.StatusReportBase);
-    sinon.stub(actionsUtil, "sendStatusReport").resolves(true);
+      .stub(statusReport, "createStatusReportBase")
+      .resolves({} as statusReport.StatusReportBase);
+    sinon.stub(statusReport, "sendStatusReport").resolves();
+    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
+
     const gitHubVersion: util.GitHubVersion = {
       type: util.GitHubVariant.DOTCOM,
     };
@@ -44,7 +49,7 @@ test("analyze action with RAM & threads from environment variables", async (t) =
     const optionalInputStub = sinon.stub(actionsUtil, "getOptionalInput");
     optionalInputStub.withArgs("cleanup-level").returns("none");
     optionalInputStub.withArgs("expect-error").returns("false");
-    sinon.stub(util, "getGitHubVersion").resolves(gitHubVersion);
+    sinon.stub(api, "getGitHubVersion").resolves(gitHubVersion);
     setupActionsVars(tmpDir, tmpDir);
     mockFeatureFlagApiEndpoint(200, {});
 
@@ -56,6 +61,7 @@ test("analyze action with RAM & threads from environment variables", async (t) =
 
     const runFinalizeStub = sinon.stub(analyze, "runFinalize");
     const runQueriesStub = sinon.stub(analyze, "runQueries");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const analyzeAction = require("./analyze-action");
 
     // When analyze-action.ts loads, it runs an async function from the top
