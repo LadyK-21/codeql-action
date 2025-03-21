@@ -1,61 +1,49 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import test, { ExecutionContext } from "ava";
-import * as yaml from "js-yaml";
+import test from "ava";
 import * as sinon from "sinon";
 
-import {
-  convertPackToQuerySuiteEntry,
-  createQuerySuiteContents,
-  runQueries,
-  validateQueryFilters,
-} from "./analyze";
+import * as actionsUtil from "./actions-util";
+import { exportedForTesting, runQueries } from "./analyze";
 import { setCodeQL } from "./codeql";
-import { Config } from "./config-utils";
-import * as count from "./count-loc";
+import { Feature } from "./feature-flags";
 import { Language } from "./languages";
 import { getRunnerLogger } from "./logging";
-import { setupTests, setupActionsVars } from "./testing-utils";
+import {
+  setupTests,
+  setupActionsVars,
+  createFeatures,
+  createTestConfig,
+} from "./testing-utils";
+import * as uploadLib from "./upload-lib";
 import * as util from "./util";
 
 setupTests(test);
 
-// Checks that the duration fields are populated for the correct language
-// and correct case of builtin or custom. Also checks the correct search
-// paths are set in the database analyze invocation.
-test("status report fields and search path setting", async (t) => {
-  const mockLinesOfCode = Object.values(Language).reduce((obj, lang, i) => {
-    // use a different line count for each language
-    obj[lang] = i + 1;
-    return obj;
-  }, {});
-  sinon.stub(count, "countLoc").resolves(mockLinesOfCode);
-  let searchPathsUsed: Array<string | undefined> = [];
+/**
+ * Checks the status report produced by the analyze Action.
+ *
+ * - Checks that the duration fields are populated for the correct language.
+ * - Checks that the QA telemetry status report fields are populated when the QA feature flag is enabled.
+ */
+test("status report fields", async (t) => {
   return await util.withTmpDir(async (tmpDir) => {
     setupActionsVars(tmpDir, tmpDir);
 
     const memoryFlag = "";
     const addSnippetsFlag = "";
     const threadsFlag = "";
-    const packs = {
-      [Language.cpp]: ["a/b@1.0.0"],
-      [Language.java]: ["c/d@2.0.0"],
-    };
+    sinon.stub(uploadLib, "validateSarifFileSchema");
 
     for (const language of Object.values(Language)) {
       setCodeQL({
+        databaseRunQueries: async () => {},
         packDownload: async () => ({ packs: [] }),
-        databaseRunQueries: async (
-          _db: string,
-          searchPath: string | undefined
-        ) => {
-          searchPathsUsed.push(searchPath);
-        },
         databaseInterpretResults: async (
           _db: string,
           _queriesRun: string[],
-          sarifFile: string
+          sarifFile: string,
         ) => {
           fs.writeFileSync(
             sarifFile,
@@ -92,338 +80,243 @@ test("status report fields and search path setting", async (t) => {
                 },
                 {},
               ],
-            })
+            }),
           );
           return "";
         },
+        databasePrintBaseline: async () => "",
       });
 
-      searchPathsUsed = [];
-      const config: Config = {
+      const config = createTestConfig({
         languages: [language],
-        queries: {},
-        pathsIgnore: [],
-        paths: [],
-        originalUserInput: {},
         tempDir: tmpDir,
-        codeQLCmd: "",
-        gitHubVersion: {
-          type: util.GitHubVariant.DOTCOM,
-        } as util.GitHubVersion,
         dbLocation: path.resolve(tmpDir, "codeql_databases"),
-        packs,
-        debugMode: false,
-        debugArtifactName: util.DEFAULT_DEBUG_ARTIFACT_NAME,
-        debugDatabaseName: util.DEFAULT_DEBUG_DATABASE_NAME,
-        augmentationProperties: {
-          injectedMlQueries: false,
-          packsInputCombines: false,
-          queriesInputCombines: false,
-        },
-        trapCaches: {},
-        trapCacheDownloadTime: 0,
-      };
+      });
       fs.mkdirSync(util.getCodeQLDatabasePath(config, language), {
         recursive: true,
       });
 
-      config.queries[language] = {
-        builtin: ["foo.ql"],
-        custom: [],
-      };
-      const builtinStatusReport = await runQueries(
+      const statusReport = await runQueries(
         tmpDir,
         memoryFlag,
         addSnippetsFlag,
         threadsFlag,
+        "brutal",
+        undefined,
         undefined,
         config,
-        getRunnerLogger(true)
+        getRunnerLogger(true),
+        createFeatures([Feature.QaTelemetryEnabled]),
       );
-      const hasPacks = language in packs;
-      const statusReportKeys = Object.keys(builtinStatusReport).sort();
-      if (hasPacks) {
-        t.deepEqual(statusReportKeys.length, 3, statusReportKeys.toString());
-        t.deepEqual(
-          statusReportKeys[0],
-          `analyze_builtin_queries_${language}_duration_ms`
-        );
-        t.deepEqual(
-          statusReportKeys[1],
-          `analyze_custom_queries_${language}_duration_ms`
-        );
-        t.deepEqual(
-          statusReportKeys[2],
-          `interpret_results_${language}_duration_ms`
-        );
-      } else {
-        t.deepEqual(
-          statusReportKeys[0],
-          `analyze_builtin_queries_${language}_duration_ms`
-        );
-        t.deepEqual(
-          statusReportKeys[1],
-          `interpret_results_${language}_duration_ms`
-        );
+      t.deepEqual(Object.keys(statusReport).sort(), [
+        "analysis_is_diff_informed",
+        `analyze_builtin_queries_${language}_duration_ms`,
+        "event_reports",
+        `interpret_results_${language}_duration_ms`,
+      ]);
+      for (const eventReport of statusReport.event_reports!) {
+        t.deepEqual(eventReport.event, "codeql database interpret-results");
+        t.true("properties" in eventReport);
+        t.true("alertCounts" in eventReport.properties!);
       }
-
-      config.queries[language] = {
-        builtin: [],
-        custom: [
-          {
-            queries: ["foo.ql"],
-            searchPath: "/1",
-          },
-          {
-            queries: ["bar.ql"],
-            searchPath: "/2",
-          },
-        ],
-      };
-      const customStatusReport = await runQueries(
-        tmpDir,
-        memoryFlag,
-        addSnippetsFlag,
-        threadsFlag,
-        undefined,
-        config,
-        getRunnerLogger(true)
-      );
-      t.deepEqual(Object.keys(customStatusReport).length, 2);
-      t.true(
-        `analyze_custom_queries_${language}_duration_ms` in customStatusReport
-      );
-      const expectedSearchPathsUsed = hasPacks
-        ? [undefined, undefined, "/1", "/2", undefined]
-        : [undefined, "/1", "/2"];
-      t.deepEqual(searchPathsUsed, expectedSearchPathsUsed);
-      t.true(`interpret_results_${language}_duration_ms` in customStatusReport);
     }
-
-    verifyLineCounts(tmpDir);
-    verifyQuerySuites(tmpDir);
   });
-
-  function verifyLineCounts(tmpDir: string) {
-    // eslint-disable-next-line github/array-foreach
-    Object.keys(Language).forEach((lang, i) => {
-      verifyLineCountForFile(path.join(tmpDir, `${lang}.sarif`), i + 1);
-    });
-  }
-
-  function verifyLineCountForFile(filePath: string, lineCount: number) {
-    const sarif = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    t.deepEqual(sarif.runs[0].properties.metricResults, [
-      {
-        rule: {
-          index: 0,
-          toolComponent: {
-            index: 0,
-          },
-        },
-        value: 123,
-        baseline: lineCount,
-      },
-    ]);
-    // when the rule doesn't exist, it should not be added
-    t.deepEqual(sarif.runs[1].properties.metricResults, []);
-  }
-
-  function verifyQuerySuites(tmpDir: string) {
-    const qlsContent = [
-      {
-        query: "foo.ql",
-      },
-    ];
-    const qlsContent2 = [
-      {
-        query: "bar.ql",
-      },
-    ];
-    for (const lang of Object.values(Language)) {
-      t.deepEqual(readContents(`${lang}-queries-builtin.qls`), qlsContent);
-      t.deepEqual(readContents(`${lang}-queries-custom-0.qls`), qlsContent);
-      t.deepEqual(readContents(`${lang}-queries-custom-1.qls`), qlsContent2);
-    }
-
-    function readContents(name: string) {
-      const x = fs.readFileSync(
-        path.join(tmpDir, "codeql_databases", name),
-        "utf8"
-      );
-      console.log(x);
-
-      return yaml.load(
-        fs.readFileSync(path.join(tmpDir, "codeql_databases", name), "utf8")
-      );
-    }
-  }
 });
 
-test("validateQueryFilters", (t) => {
-  t.notThrows(() => validateQueryFilters([]));
-  t.notThrows(() => validateQueryFilters(undefined));
-  t.notThrows(() => {
-    return validateQueryFilters([
-      {
-        exclude: {
-          "problem.severity": "recommendation",
-        },
-      },
-      {
-        exclude: {
-          "tags contain": ["foo", "bar"],
-        },
-      },
-      {
-        include: {
-          "problem.severity": "something-to-think-about",
-        },
-      },
-      {
-        include: {
-          "tags contain": ["baz", "bop"],
-        },
-      },
-    ]);
-  });
-
-  t.throws(
-    () => {
-      return validateQueryFilters([
-        {
-          exclude: {
-            "tags contain": ["foo", "bar"],
-          },
-          include: {
-            "tags contain": ["baz", "bop"],
-          },
-        },
-      ]);
+function runGetDiffRanges(changes: number, patch: string[] | undefined): any {
+  sinon
+    .stub(actionsUtil, "getRequiredInput")
+    .withArgs("checkout_path")
+    .returns("/checkout/path");
+  return exportedForTesting.getDiffRanges(
+    {
+      filename: "test.txt",
+      changes,
+      patch: patch?.join("\n"),
     },
-    { message: /Query filter must have exactly one key/ }
+    getRunnerLogger(true),
   );
+}
 
-  t.throws(
-    () => {
-      return validateQueryFilters([{ xxx: "foo" } as any]);
+test("getDiffRanges: file unchanged", async (t) => {
+  const diffRanges = runGetDiffRanges(0, undefined);
+  t.deepEqual(diffRanges, []);
+});
+
+test("getDiffRanges: file diff too large", async (t) => {
+  const diffRanges = runGetDiffRanges(1000000, undefined);
+  t.deepEqual(diffRanges, [
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 0,
+      endLine: 0,
     },
-    { message: /Only "include" or "exclude" filters are allowed/ }
-  );
+  ]);
+});
 
-  t.throws(
-    () => {
-      return validateQueryFilters({ exclude: "foo" } as any);
+test("getDiffRanges: diff thunk with single addition range", async (t) => {
+  const diffRanges = runGetDiffRanges(2, [
+    "@@ -30,6 +50,8 @@",
+    " a",
+    " b",
+    " c",
+    "+1",
+    "+2",
+    " d",
+    " e",
+    " f",
+  ]);
+  t.deepEqual(diffRanges, [
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 53,
+      endLine: 54,
+    },
+  ]);
+});
+
+test("getDiffRanges: diff thunk with single deletion range", async (t) => {
+  const diffRanges = runGetDiffRanges(2, [
+    "@@ -30,8 +50,6 @@",
+    " a",
+    " b",
+    " c",
+    "-1",
+    "-2",
+    " d",
+    " e",
+    " f",
+  ]);
+  t.deepEqual(diffRanges, []);
+});
+
+test("getDiffRanges: diff thunk with single update range", async (t) => {
+  const diffRanges = runGetDiffRanges(2, [
+    "@@ -30,7 +50,7 @@",
+    " a",
+    " b",
+    " c",
+    "-1",
+    "+2",
+    " d",
+    " e",
+    " f",
+  ]);
+  t.deepEqual(diffRanges, [
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 53,
+      endLine: 53,
+    },
+  ]);
+});
+
+test("getDiffRanges: diff thunk with addition ranges", async (t) => {
+  const diffRanges = runGetDiffRanges(2, [
+    "@@ -30,7 +50,9 @@",
+    " a",
+    " b",
+    " c",
+    "+1",
+    " c",
+    "+2",
+    " d",
+    " e",
+    " f",
+  ]);
+  t.deepEqual(diffRanges, [
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 53,
+      endLine: 53,
     },
     {
-      message:
-        /Query filters must be an array of "include" or "exclude" entries/,
-    }
-  );
+      path: "/checkout/path/test.txt",
+      startLine: 55,
+      endLine: 55,
+    },
+  ]);
 });
 
-const convertPackToQuerySuiteEntryMacro = test.macro({
-  exec: (t: ExecutionContext<unknown>, packSpec: string, suiteEntry: any) =>
-    t.deepEqual(convertPackToQuerySuiteEntry(packSpec), suiteEntry),
-
-  title: (_providedTitle, packSpec: string) => `Query Suite Entry: ${packSpec}`,
+test("getDiffRanges: diff thunk with mixed ranges", async (t) => {
+  const diffRanges = runGetDiffRanges(2, [
+    "@@ -30,7 +50,7 @@",
+    " a",
+    " b",
+    " c",
+    "-1",
+    " d",
+    "-2",
+    "+3",
+    " e",
+    " f",
+    "+4",
+    "+5",
+    " g",
+    " h",
+    " i",
+  ]);
+  t.deepEqual(diffRanges, [
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 54,
+      endLine: 54,
+    },
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 57,
+      endLine: 58,
+    },
+  ]);
 });
 
-test(convertPackToQuerySuiteEntryMacro, "a/b", {
-  qlpack: "a/b",
-  from: undefined,
-  version: undefined,
-  query: undefined,
-  queries: undefined,
-  apply: undefined,
+test("getDiffRanges: multiple diff thunks", async (t) => {
+  const diffRanges = runGetDiffRanges(2, [
+    "@@ -30,6 +50,8 @@",
+    " a",
+    " b",
+    " c",
+    "+1",
+    "+2",
+    " d",
+    " e",
+    " f",
+    "@@ -130,6 +150,8 @@",
+    " a",
+    " b",
+    " c",
+    "+1",
+    "+2",
+    " d",
+    " e",
+    " f",
+  ]);
+  t.deepEqual(diffRanges, [
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 53,
+      endLine: 54,
+    },
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 153,
+      endLine: 154,
+    },
+  ]);
 });
 
-test(convertPackToQuerySuiteEntryMacro, "a/b@~1.2.3", {
-  qlpack: "a/b",
-  from: undefined,
-  version: "~1.2.3",
-  query: undefined,
-  queries: undefined,
-  apply: undefined,
+test("getDiffRanges: no diff context lines", async (t) => {
+  const diffRanges = runGetDiffRanges(2, ["@@ -30 +50,2 @@", "+1", "+2"]);
+  t.deepEqual(diffRanges, [
+    {
+      path: "/checkout/path/test.txt",
+      startLine: 50,
+      endLine: 51,
+    },
+  ]);
 });
 
-test(convertPackToQuerySuiteEntryMacro, "a/b:my/path", {
-  qlpack: undefined,
-  from: "a/b",
-  version: undefined,
-  query: undefined,
-  queries: "my/path",
-  apply: undefined,
-});
-
-test(convertPackToQuerySuiteEntryMacro, "a/b@~1.2.3:my/path", {
-  qlpack: undefined,
-  from: "a/b",
-  version: "~1.2.3",
-  query: undefined,
-  queries: "my/path",
-  apply: undefined,
-});
-
-test(convertPackToQuerySuiteEntryMacro, "a/b:my/path/query.ql", {
-  qlpack: undefined,
-  from: "a/b",
-  version: undefined,
-  query: "my/path/query.ql",
-  queries: undefined,
-  apply: undefined,
-});
-
-test(convertPackToQuerySuiteEntryMacro, "a/b@~1.2.3:my/path/query.ql", {
-  qlpack: undefined,
-  from: "a/b",
-  version: "~1.2.3",
-  query: "my/path/query.ql",
-  queries: undefined,
-  apply: undefined,
-});
-
-test(convertPackToQuerySuiteEntryMacro, "a/b:my/path/suite.qls", {
-  qlpack: undefined,
-  from: "a/b",
-  version: undefined,
-  query: undefined,
-  queries: undefined,
-  apply: "my/path/suite.qls",
-});
-
-test(convertPackToQuerySuiteEntryMacro, "a/b@~1.2.3:my/path/suite.qls", {
-  qlpack: undefined,
-  from: "a/b",
-  version: "~1.2.3",
-  query: undefined,
-  queries: undefined,
-  apply: "my/path/suite.qls",
-});
-
-test("convertPackToQuerySuiteEntry Failure", (t) => {
-  t.throws(() => convertPackToQuerySuiteEntry("this-is-not-a-pack"));
-});
-
-test("createQuerySuiteContents", (t) => {
-  const yamlResult = createQuerySuiteContents(
-    ["query1.ql", "query2.ql"],
-    [
-      {
-        exclude: { "problem.severity": "recommendation" },
-      },
-      {
-        include: { "problem.severity": "recommendation" },
-      },
-    ]
-  );
-  const expected = `- query: query1.ql
-- query: query2.ql
-- exclude:
-    problem.severity: recommendation
-- include:
-    problem.severity: recommendation
-`;
-
-  t.deepEqual(yamlResult, expected);
+test("getDiffRanges: malformed thunk header", async (t) => {
+  const diffRanges = runGetDiffRanges(2, ["@@ 30 +50,2 @@", "+1", "+2"]);
+  t.deepEqual(diffRanges, undefined);
 });

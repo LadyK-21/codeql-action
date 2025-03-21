@@ -1,14 +1,23 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import * as cache from "@actions/cache";
+import * as actionsCache from "@actions/cache";
 
 import * as actionsUtil from "./actions-util";
-import { CodeQL, CODEQL_VERSION_BETTER_RESOLVE_LANGUAGES } from "./codeql";
-import { Config } from "./config-utils";
+import * as apiClient from "./api-client";
+import { CodeQL } from "./codeql";
+import type { Config } from "./config-utils";
+import { DocUrl } from "./doc-url";
+import { Feature, FeatureEnablement } from "./feature-flags";
+import * as gitUtils from "./git-utils";
 import { Language } from "./languages";
 import { Logger } from "./logging";
-import { codeQlVersionAbove, tryGetFolderBytes } from "./util";
+import {
+  getErrorMessage,
+  isHTTPError,
+  tryGetFolderBytes,
+  withTimeout,
+} from "./util";
 
 // This constant should be bumped if we make a breaking change
 // to how the CodeQL Action stores or retrieves the TRAP cache,
@@ -17,37 +26,17 @@ import { codeQlVersionAbove, tryGetFolderBytes } from "./util";
 // goes into the cache key.
 const CACHE_VERSION = 1;
 
-// This constant sets the size of each TRAP cache in megabytes.
-const CACHE_SIZE_MB = 1024;
+const CODEQL_TRAP_CACHE_PREFIX = "codeql-trap";
 
 // This constant sets the minimum size in megabytes of a TRAP
 // cache for us to consider it worth uploading.
 const MINIMUM_CACHE_MB_TO_UPLOAD = 10;
 
-export async function getTrapCachingExtractorConfigArgs(
-  config: Config
-): Promise<string[]> {
-  const result: string[][] = [];
-  for (const language of config.languages)
-    result.push(
-      await getTrapCachingExtractorConfigArgsForLang(config, language)
-    );
-  return result.flat();
-}
-
-export async function getTrapCachingExtractorConfigArgsForLang(
-  config: Config,
-  language: Language
-): Promise<string[]> {
-  const cacheDir = config.trapCaches[language];
-  if (cacheDir === undefined) return [];
-  const write = await actionsUtil.isAnalyzingDefaultBranch();
-  return [
-    `-O=${language}.trap.cache.dir=${cacheDir}`,
-    `-O=${language}.trap.cache.bound=${CACHE_SIZE_MB}`,
-    `-O=${language}.trap.cache.write=${write}`,
-  ];
-}
+// The maximum number of milliseconds to wait for TRAP cache
+// uploads or downloads to complete before continuing. Note
+// this timeout is per operation, so will be run as many
+// times as there are languages with TRAP caching enabled.
+const MAX_CACHE_OPERATION_MS = 120_000; // Two minutes
 
 /**
  * Download TRAP caches from the Actions cache.
@@ -60,22 +49,22 @@ export async function getTrapCachingExtractorConfigArgsForLang(
 export async function downloadTrapCaches(
   codeql: CodeQL,
   languages: Language[],
-  logger: Logger
+  logger: Logger,
 ): Promise<Partial<Record<Language, string>>> {
-  const result = {};
+  const result: Partial<Record<Language, string>> = {};
   const languagesSupportingCaching = await getLanguagesSupportingCaching(
     codeql,
     languages,
-    logger
+    logger,
   );
   logger.info(
-    `Found ${languagesSupportingCaching.length} languages that support TRAP caching`
+    `Found ${languagesSupportingCaching.length} languages that support TRAP caching`,
   );
   if (languagesSupportingCaching.length === 0) return result;
 
   const cachesDir = path.join(
     actionsUtil.getTemporaryDirectory(),
-    "trapCaches"
+    "trapCaches",
   );
   for (const language of languagesSupportingCaching) {
     const cacheDir = path.join(cachesDir, language);
@@ -83,9 +72,9 @@ export async function downloadTrapCaches(
     result[language] = cacheDir;
   }
 
-  if (await actionsUtil.isAnalyzingDefaultBranch()) {
+  if (await gitUtils.isAnalyzingDefaultBranch()) {
     logger.info(
-      "Analyzing default branch. Skipping downloading of TRAP caches."
+      "Analyzing default branch. Skipping downloading of TRAP caches.",
     );
     return result;
   }
@@ -93,7 +82,7 @@ export async function downloadTrapCaches(
   let baseSha = "unknown";
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (
-    actionsUtil.workflowEventName() === "pull_request" &&
+    actionsUtil.getWorkflowEventName() === "pull_request" &&
     eventPath !== undefined
   ) {
     const event = JSON.parse(fs.readFileSync(path.resolve(eventPath), "utf-8"));
@@ -105,11 +94,20 @@ export async function downloadTrapCaches(
     // The SHA from the base of the PR is the most similar commit we might have a cache for
     const preferredKey = await cacheKey(codeql, language, baseSha);
     logger.info(
-      `Looking in Actions cache for TRAP cache with key ${preferredKey}`
+      `Looking in Actions cache for TRAP cache with key ${preferredKey}`,
     );
-    const found = await cache.restoreCache([cacheDir], preferredKey, [
-      await cachePrefix(codeql, language), // Fall back to any cache with the right key prefix
-    ]);
+    const found = await withTimeout(
+      MAX_CACHE_OPERATION_MS,
+      actionsCache.restoreCache([cacheDir], preferredKey, [
+        // Fall back to any cache with the right key prefix
+        await cachePrefix(codeql, language),
+      ]),
+      () => {
+        logger.info(
+          `Timed out downloading cache for ${language}, will continue without it`,
+        );
+      },
+    );
     if (found === undefined) {
       // We didn't find a TRAP cache in the Actions cache, so the directory on disk is
       // still just an empty directory. There's no reason to tell the extractor to use it,
@@ -132,61 +130,164 @@ export async function downloadTrapCaches(
 export async function uploadTrapCaches(
   codeql: CodeQL,
   config: Config,
-  logger: Logger
+  logger: Logger,
 ): Promise<boolean> {
-  if (!(await actionsUtil.isAnalyzingDefaultBranch())) return false; // Only upload caches from the default branch
+  if (!(await gitUtils.isAnalyzingDefaultBranch())) return false; // Only upload caches from the default branch
 
-  const toAwait: Array<Promise<number>> = [];
   for (const language of config.languages) {
     const cacheDir = config.trapCaches[language];
     if (cacheDir === undefined) continue;
     const trapFolderSize = await tryGetFolderBytes(cacheDir, logger);
     if (trapFolderSize === undefined) {
       logger.info(
-        `Skipping upload of TRAP cache for ${language} as we couldn't determine its size`
+        `Skipping upload of TRAP cache for ${language} as we couldn't determine its size`,
       );
       continue;
     }
     if (trapFolderSize < MINIMUM_CACHE_MB_TO_UPLOAD * 1_048_576) {
       logger.info(
-        `Skipping upload of TRAP cache for ${language} as it is too small`
+        `Skipping upload of TRAP cache for ${language} as it is too small`,
       );
       continue;
     }
     const key = await cacheKey(
       codeql,
       language,
-      process.env.GITHUB_SHA || "unknown"
+      process.env.GITHUB_SHA || "unknown",
     );
     logger.info(`Uploading TRAP cache to Actions cache with key ${key}`);
-    toAwait.push(cache.saveCache([cacheDir], key));
+    await withTimeout(
+      MAX_CACHE_OPERATION_MS,
+      actionsCache.saveCache([cacheDir], key),
+      () => {
+        logger.info(
+          `Timed out waiting for TRAP cache for ${language} to upload, will continue without uploading`,
+        );
+      },
+    );
   }
-  await Promise.all(toAwait);
   return true;
+}
+
+export interface TrapCacheCleanupStatusReport {
+  trap_cache_cleanup_error?: string;
+  trap_cache_cleanup_size_bytes?: number;
+  trap_cache_cleanup_skipped_because?: string;
+}
+
+export async function cleanupTrapCaches(
+  config: Config,
+  features: FeatureEnablement,
+  logger: Logger,
+): Promise<TrapCacheCleanupStatusReport> {
+  if (!(await features.getValue(Feature.CleanupTrapCaches))) {
+    return {
+      trap_cache_cleanup_skipped_because: "feature disabled",
+    };
+  }
+  if (!(await gitUtils.isAnalyzingDefaultBranch())) {
+    return {
+      trap_cache_cleanup_skipped_because: "not analyzing default branch",
+    };
+  }
+
+  try {
+    let totalBytesCleanedUp = 0;
+
+    const allCaches = await apiClient.listActionsCaches(
+      CODEQL_TRAP_CACHE_PREFIX,
+      await gitUtils.getRef(),
+    );
+
+    for (const language of config.languages) {
+      if (config.trapCaches[language]) {
+        const cachesToRemove = await getTrapCachesForLanguage(
+          allCaches,
+          language,
+          logger,
+        );
+        // Dates returned by the API are in ISO 8601 format, so we can sort them lexicographically
+        cachesToRemove.sort((a, b) => a.created_at.localeCompare(b.created_at));
+        // Keep the most recent cache
+        const mostRecentCache = cachesToRemove.pop();
+        logger.debug(
+          `Keeping most recent TRAP cache (${JSON.stringify(mostRecentCache)})`,
+        );
+
+        if (cachesToRemove.length === 0) {
+          logger.info(`No TRAP caches to clean up for ${language}.`);
+          continue;
+        }
+
+        for (const cache of cachesToRemove) {
+          logger.debug(`Cleaning up TRAP cache (${JSON.stringify(cache)})`);
+          await apiClient.deleteActionsCache(cache.id);
+        }
+        const bytesCleanedUp = cachesToRemove.reduce(
+          (acc, item) => acc + item.size_in_bytes,
+          0,
+        );
+        totalBytesCleanedUp += bytesCleanedUp;
+        const megabytesCleanedUp = (bytesCleanedUp / (1024 * 1024)).toFixed(2);
+        logger.info(
+          `Cleaned up ${megabytesCleanedUp} MiB of old TRAP caches for ${language}.`,
+        );
+      }
+    }
+    return { trap_cache_cleanup_size_bytes: totalBytesCleanedUp };
+  } catch (e) {
+    if (isHTTPError(e) && e.status === 403) {
+      logger.warning(
+        "Could not cleanup TRAP caches as the token did not have the required permissions. " +
+          'To clean up TRAP caches, ensure the token has the "actions:write" permission. ' +
+          `See ${DocUrl.ASSIGNING_PERMISSIONS_TO_JOBS} for more information.`,
+      );
+    } else {
+      logger.info(`Failed to cleanup TRAP caches, continuing. Details: ${e}`);
+    }
+    return { trap_cache_cleanup_error: getErrorMessage(e) };
+  }
+}
+
+async function getTrapCachesForLanguage(
+  allCaches: apiClient.ActionsCacheItem[],
+  language: Language,
+  logger: Logger,
+): Promise<Array<Required<apiClient.ActionsCacheItem>>> {
+  logger.debug(`Listing TRAP caches for ${language}`);
+
+  for (const cache of allCaches) {
+    if (!cache.created_at || !cache.id || !cache.key || !cache.size_in_bytes) {
+      throw new Error(
+        "An unexpected cache item was returned from the API that was missing one or " +
+          `more required fields: ${JSON.stringify(cache)}`,
+      );
+    }
+  }
+
+  return allCaches.filter((cache) => {
+    return cache.key?.includes(`-${language}-`);
+  }) as Array<Required<apiClient.ActionsCacheItem>>;
 }
 
 export async function getLanguagesSupportingCaching(
   codeql: CodeQL,
   languages: Language[],
-  logger: Logger
+  logger: Logger,
 ): Promise<Language[]> {
   const result: Language[] = [];
-  if (
-    !(await codeQlVersionAbove(codeql, CODEQL_VERSION_BETTER_RESOLVE_LANGUAGES))
-  )
-    return result;
   const resolveResult = await codeql.betterResolveLanguages();
   outer: for (const lang of languages) {
     const extractorsForLanguage = resolveResult.extractors[lang];
     if (extractorsForLanguage === undefined) {
       logger.info(
-        `${lang} does not support TRAP caching (couldn't find an extractor)`
+        `${lang} does not support TRAP caching (couldn't find an extractor)`,
       );
       continue;
     }
     if (extractorsForLanguage.length !== 1) {
       logger.info(
-        `${lang} does not support TRAP caching (found multiple extractors)`
+        `${lang} does not support TRAP caching (found multiple extractors)`,
       );
       continue;
     }
@@ -195,14 +296,14 @@ export async function getLanguagesSupportingCaching(
       extractor.extractor_options?.trap?.properties?.cache?.properties;
     if (trapCacheOptions === undefined) {
       logger.info(
-        `${lang} does not support TRAP caching (missing option group)`
+        `${lang} does not support TRAP caching (missing option group)`,
       );
       continue;
     }
     for (const requiredOpt of ["dir", "bound", "write"]) {
       if (!(requiredOpt in trapCacheOptions)) {
         logger.info(
-          `${lang} does not support TRAP caching (missing ${requiredOpt} option)`
+          `${lang} does not support TRAP caching (missing ${requiredOpt} option)`,
         );
         continue outer;
       }
@@ -212,29 +313,19 @@ export async function getLanguagesSupportingCaching(
   return result;
 }
 
-export async function getTotalCacheSize(
-  trapCaches: Partial<Record<Language, string>>,
-  logger: Logger
-): Promise<number> {
-  const sizes = await Promise.all(
-    Object.values(trapCaches).map((cacheDir) =>
-      tryGetFolderBytes(cacheDir, logger)
-    )
-  );
-  return sizes.map((a) => a || 0).reduce((a, b) => a + b, 0);
-}
-
 async function cacheKey(
   codeql: CodeQL,
   language: Language,
-  baseSha: string
+  baseSha: string,
 ): Promise<string> {
   return `${await cachePrefix(codeql, language)}${baseSha}`;
 }
 
 async function cachePrefix(
   codeql: CodeQL,
-  language: Language
+  language: Language,
 ): Promise<string> {
-  return `codeql-trap-${CACHE_VERSION}-${await codeql.getVersion()}-${language}-`;
+  return `${CODEQL_TRAP_CACHE_PREFIX}-${CACHE_VERSION}-${
+    (await codeql.getVersion()).version
+  }-${language}-`;
 }

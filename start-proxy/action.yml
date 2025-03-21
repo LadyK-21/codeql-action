@@ -1,0 +1,31 @@
+name: "CodeQL: Start proxy"
+description: "[Experimental] Start HTTP proxy server. This action is for internal GitHub used only and will change without notice."
+author: "GitHub"
+inputs:
+  registry_secrets:
+    description: The URLs and credentials of package registries
+    required: false
+    default: "[]"
+  registries_credentials:
+    description: Base64 encoded JSON configuration for the URLs and credentials of the package registries
+    required: false
+  token:
+    description: "GitHub token to use for authenticating with this instance of GitHub. The token must be the built-in GitHub Actions token, and the workflow must have the `security-events: write` permission. Most of the time it is advisable to avoid specifying this input so that the workflow falls back to using the default value."
+    default: ${{ github.token }}
+    required: false
+  language:
+    description: The programming language to setup the proxy for the correct ecosystem
+    required: false
+outputs:
+  proxy_host:
+    description: The IP address of the proxy
+  proxy_port:
+    description: The port of the proxy
+  proxy_ca_certificate:
+    description: The proxy's internal CA certificate in PEM format
+  proxy_urls:
+    description: A stringified JSON array of objects containing the types and URLs of the configured registries.
+runs:
+  using: node20
+  main: "../lib/start-proxy-action.js"
+  post: "../lib/start-proxy-action-post.js"

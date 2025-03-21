@@ -1,12 +1,7 @@
 'use strict'
 
-const debug = require('debug')('nock.request_overrider')
-const {
-  IncomingMessage,
-  ClientRequest,
-  request: originalHttpRequest,
-} = require('http')
-const { request: originalHttpsRequest } = require('https')
+const { request_overrider: debug } = require('./debug')
+const { IncomingMessage, ClientRequest } = require('http')
 const propagate = require('propagate')
 const common = require('./common')
 const globalEmitter = require('./global_emitter')
@@ -40,7 +35,10 @@ class InterceptedRequestRouter {
       // affecting the user so we use a clone of the object.
       ...options,
       // We use lower-case header field names throughout Nock.
-      headers: common.headersFieldNamesToLowerCase(options.headers || {}),
+      headers: common.headersFieldNamesToLowerCase(
+        options.headers || {},
+        false,
+      ),
     }
     this.interceptors = interceptors
 
@@ -48,8 +46,14 @@ class InterceptedRequestRouter {
 
     // support setting `timeout` using request `options`
     // https://nodejs.org/docs/latest-v12.x/api/http.html#http_http_request_url_options_callback
-    if (options.timeout) {
-      this.socket.setTimeout(options.timeout)
+    // any timeout in the request options override any timeout in the agent options.
+    // per https://github.com/nodejs/node/pull/21204
+    const timeout =
+      options.timeout ||
+      (options.agent && options.agent.options && options.agent.options.timeout)
+
+    if (timeout) {
+      this.socket.setTimeout(timeout)
     }
 
     this.response = new IncomingMessage(this.socket)
@@ -80,7 +84,7 @@ class InterceptedRequestRouter {
       req.setHeader(
         // We use lower-case header field names throughout Nock.
         'authorization',
-        `Basic ${Buffer.from(options.auth).toString('base64')}`
+        `Basic ${Buffer.from(options.auth).toString('base64')}`,
       )
     }
 
@@ -134,8 +138,11 @@ class InterceptedRequestRouter {
 
   // from docs: When write function is called with empty string or buffer, it does nothing and waits for more input.
   // However, actually implementation checks the state of finished and aborted before checking if the first arg is empty.
-  handleWrite(buffer, encoding, callback) {
+  handleWrite(...args) {
     debug('request write')
+
+    let [buffer, encoding] = args
+
     const { req } = this
 
     if (req.finished) {
@@ -153,7 +160,7 @@ class InterceptedRequestRouter {
       return false
     }
 
-    if (!buffer || buffer.length === 0) {
+    if (!buffer) {
       return true
     }
 
@@ -162,6 +169,9 @@ class InterceptedRequestRouter {
     }
     this.requestBodyBuffers.push(buffer)
 
+    // writable.write encoding param is optional
+    // so if callback is present it's the last argument
+    const callback = args.length > 1 ? args[args.length - 1] : undefined
     // can't use instanceof Function because some test runners
     // run tests in vm.runInNewContext where Function is not same
     // as that in the current context
@@ -279,20 +289,19 @@ class InterceptedRequestRouter {
     const requestBodyBuffer = Buffer.concat(this.requestBodyBuffers)
     // When request body is a binary buffer we internally use in its hexadecimal
     // representation.
-    const requestBodyIsUtf8Representable = common.isUtf8Representable(
-      requestBodyBuffer
-    )
+    const requestBodyIsUtf8Representable =
+      common.isUtf8Representable(requestBodyBuffer)
     const requestBodyString = requestBodyBuffer.toString(
-      requestBodyIsUtf8Representable ? 'utf8' : 'hex'
+      requestBodyIsUtf8Representable ? 'utf8' : 'hex',
     )
 
     const matchedInterceptor = interceptors.find(i =>
-      i.match(req, options, requestBodyString)
+      i.match(req, options, requestBodyString),
     )
 
     if (matchedInterceptor) {
       matchedInterceptor.scope.logger(
-        'interceptor identified, starting mocking'
+        'interceptor identified, starting mocking',
       )
 
       matchedInterceptor.markConsumed()
@@ -315,18 +324,11 @@ class InterceptedRequestRouter {
 
       // Try to find a hostname match that allows unmocked.
       const allowUnmocked = interceptors.some(
-        i => i.matchHostName(options) && i.options.allowUnmocked
+        i => i.matchHostName(options) && i.options.allowUnmocked,
       )
 
       if (allowUnmocked && req instanceof ClientRequest) {
-        const newReq =
-          options.proto === 'https'
-            ? originalHttpsRequest(options)
-            : originalHttpRequest(options)
-
-        propagate(newReq, req)
-        // We send the raw buffer as we received it, not as we interpreted it.
-        newReq.end(requestBodyBuffer)
+        req.emit('real-request')
       } else {
         const reqStr = common.stringifyRequest(options, requestBodyString)
         const err = new Error(`Nock: No match for request ${reqStr}`)
